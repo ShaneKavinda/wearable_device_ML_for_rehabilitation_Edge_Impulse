@@ -1,4 +1,4 @@
-#include <gesture_recognation_-_1_imu_and_left_hand_inferencing.h>
+#include <ei_gesture_left_hand_imu.h>
 #include <Wire.h>
 
 #define ICM20948_ADDR 0x68
