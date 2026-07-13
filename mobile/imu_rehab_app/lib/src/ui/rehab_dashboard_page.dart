@@ -1,10 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../constants.dart';
 import '../models/pc_api_models.dart';
+import '../services/benchmark_logger.dart';
 import '../services/ble_sensor_port.dart';
 
 class RehabDashboardPage extends StatefulWidget {
@@ -21,6 +24,7 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
   StreamSubscription<bool>? _scanStateSubscription;
   StreamSubscription<bool>? _connectionSubscription;
   StreamSubscription<String>? _lineSubscription;
+  late final Future<OnboardMetricsLogger> _metricsLoggerFuture;
 
   List<BleSensorDevice> _devices = const <BleSensorDevice>[];
   final List<_DirectEvent> _events = <_DirectEvent>[];
@@ -34,20 +38,25 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
   String _status = 'ESP32 disconnected';
   String _boardResponse = 'Waiting for XIAO board';
   String _activeTarget = '';
+  File? _metricsLogFile;
   bool _scanning = false;
   bool _connected = false;
   bool _busy = false;
   bool _sessionRunning = false;
   bool _takingReadings = false;
+  bool _sharingLog = false;
   int _scanAdvertisementCount = 0;
   int _scanNamedCount = 0;
   int _resultCount = 0;
   int _statusCount = 0;
   int _invalidLineCount = 0;
+  int _loggedMetricCount = 0;
 
   @override
   void initState() {
     super.initState();
+    _metricsLoggerFuture = OnboardMetricsLogger.createDefault();
+    unawaited(_prepareMetricsLog());
     _scanResultsSubscription = _esp32Port.scanResults.listen(
       _handleScanResults,
     );
@@ -368,6 +377,15 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
 
   void _handleInferenceResult(Map<String, Object?> json) {
     final result = PcInferenceResult.fromJson(json);
+    unawaited(
+      _appendMetricsLog(
+        (logger, timestamp) => OnboardMetricsLogEntry.inferenceResult(
+          sessionId: logger.sessionId,
+          isoTimeUtc: timestamp,
+          json: json,
+        ),
+      ),
+    );
     setState(() {
       _latestResult = result;
       _latestRawResult = json;
@@ -387,6 +405,15 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
 
   void _handleSessionSummary(Map<String, Object?> json) {
     final summary = PcSessionSummary.fromJson(json);
+    unawaited(
+      _appendMetricsLog(
+        (logger, timestamp) => OnboardMetricsLogEntry.sessionSummary(
+          sessionId: logger.sessionId,
+          isoTimeUtc: timestamp,
+          json: json,
+        ),
+      ),
+    );
     setState(() {
       _latestSummary = summary;
       _sessionRunning = false;
@@ -408,6 +435,95 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
       _status = 'ESP32 status: $message';
       _addEvent(_status);
     });
+  }
+
+  Future<void> _prepareMetricsLog() async {
+    try {
+      final logger = await _metricsLoggerFuture;
+      final file = await logger.ensureFile();
+      if (!mounted) {
+        return;
+      }
+      setState(() => _metricsLogFile = file);
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = 'Log setup failed: $error';
+        _addEvent('log setup failed');
+      });
+    }
+  }
+
+  Future<void> _appendMetricsLog(
+    OnboardMetricsLogEntry Function(
+      OnboardMetricsLogger logger,
+      DateTime timestamp,
+    )
+    createEntry,
+  ) async {
+    try {
+      final logger = await _metricsLoggerFuture;
+      final file = await logger.append(createEntry(logger, DateTime.now()));
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _metricsLogFile = file;
+        _loggedMetricCount += 1;
+      });
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = 'Log write failed: $error';
+        _addEvent('log write failed');
+      });
+    }
+  }
+
+  Future<void> _shareMetricsLog() async {
+    if (_sharingLog) {
+      return;
+    }
+
+    setState(() => _sharingLog = true);
+    try {
+      final logger = await _metricsLoggerFuture;
+      final file = await logger.ensureFile();
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _metricsLogFile = file);
+      await SharePlus.instance.share(
+        ShareParams(
+          title: 'IMU rehab metrics log',
+          subject: 'IMU rehab metrics log',
+          text: 'IMU rehab onboard metrics log',
+          files: <XFile>[
+            XFile(
+              file.path,
+              mimeType: 'text/csv',
+              name: file.uri.pathSegments.last,
+            ),
+          ],
+        ),
+      );
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not share log: $error')));
+    } finally {
+      if (mounted) {
+        setState(() => _sharingLog = false);
+      }
+    }
   }
 
   BleSensorDevice? get _selectedEsp32 {
@@ -438,6 +554,16 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
             tooltip: 'Scan for ESP32',
             onPressed: !_connected && !_busy ? _scanForEsp32 : null,
             icon: const Icon(Icons.bluetooth_searching),
+          ),
+          IconButton(
+            tooltip: 'Share metrics log',
+            onPressed: _sharingLog ? null : _shareMetricsLog,
+            icon: _sharingLog
+                ? const SizedBox.square(
+                    dimension: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.ios_share),
           ),
         ],
       ),
@@ -487,6 +613,8 @@ class _RehabDashboardPageState extends State<RehabDashboardPage> {
               statusCount: _statusCount,
               invalidLineCount: _invalidLineCount,
               activeTarget: _activeTarget,
+              loggedMetricCount: _loggedMetricCount,
+              logFilePath: _metricsLogFile?.path,
               repetitionEvent: _latestRepetitionEvent,
               result: latestResult,
               summary: latestSummary,
@@ -824,6 +952,8 @@ class _Esp32MetricsPanel extends StatelessWidget {
     required this.statusCount,
     required this.invalidLineCount,
     required this.activeTarget,
+    required this.loggedMetricCount,
+    required this.logFilePath,
     required this.repetitionEvent,
     required this.result,
     required this.summary,
@@ -836,6 +966,8 @@ class _Esp32MetricsPanel extends StatelessWidget {
   final int statusCount;
   final int invalidLineCount;
   final String activeTarget;
+  final int loggedMetricCount;
+  final String? logFilePath;
   final PcRepetitionEvent? repetitionEvent;
   final PcInferenceResult? result;
   final PcSessionSummary? summary;
@@ -863,6 +995,8 @@ class _Esp32MetricsPanel extends StatelessWidget {
                   : '${repetitionEvent!.repetition}: ${_labelForEvent(repetitionEvent!.event)}',
             ),
             _MetricRow('Results', resultCount.toString()),
+            _MetricRow('Logged rows', loggedMetricCount.toString()),
+            _MetricRow('Log file', logFilePath ?? '-'),
             _MetricRow('Status messages', statusCount.toString()),
             _MetricRow('Invalid lines', invalidLineCount.toString()),
             _MetricRow('Device ID', _rawString(rawResult, 'device_id')),
