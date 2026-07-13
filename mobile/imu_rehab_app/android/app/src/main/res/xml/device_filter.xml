@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Raspberry Pi Pico / Pico W USB serial commonly appears as 0x2E8A. -->
+    <usb-device vendor-id="11914" />
+
+    <!-- Common USB serial adapters used while prototyping. -->
+    <usb-device vendor-id="1027" />
+    <usb-device vendor-id="9025" />
+    <usb-device vendor-id="4292" product-id="60000" />
+    <usb-device vendor-id="1659" product-id="8963" />
+    <usb-device vendor-id="6790" product-id="29987" />
+</resources>

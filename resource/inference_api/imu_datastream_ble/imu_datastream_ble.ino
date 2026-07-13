@@ -235,11 +235,21 @@ void initBLE() {
     service->start();
 
     BLEAdvertising *advertising = BLEDevice::getAdvertising();
-    advertising->addServiceUUID(BLE_SERVICE_UUID);
+
+    BLEAdvertisementData advertisementData;
+    advertisementData.setFlags(0x06);
+    advertisementData.setCompleteServices(BLEUUID(BLE_SERVICE_UUID));
+    advertising->setAdvertisementData(advertisementData);
+
+    BLEAdvertisementData scanResponseData;
+    scanResponseData.setName(BLE_DEVICE_NAME);
+    advertising->setScanResponseData(scanResponseData);
+
     advertising->setScanResponse(true);
     advertising->setMinPreferred(0x06);
     advertising->setMinPreferred(0x12);
     BLEDevice::startAdvertising();
+    Serial.println("BLE advertising as IMU-Datastream");
 }
 
 void handleCommand(char command) {

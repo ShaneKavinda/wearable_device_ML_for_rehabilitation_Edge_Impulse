@@ -1,0 +1,27 @@
+name: imu_rehab_app
+description: Android-first Flutter app for BLE ESP32 IMU inference results.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^2.0.0
+  http: ^1.5.0
+  path_provider: ^2.1.6
+  share_plus: ^13.1.0
+  usb_serial: ^0.5.2
+  web_socket_channel: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/model/
