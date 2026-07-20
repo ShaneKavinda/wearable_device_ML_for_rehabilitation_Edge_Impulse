@@ -1,0 +1,23 @@
+services:
+  inference:
+    build:
+      context: ../../..
+      dockerfile: resource/inference_api/cloud_service/Dockerfile
+    image: imu-rehab-cloud-inference:deployment-19
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    cpus: 1.0
+    mem_limit: 512m
+    environment:
+      API_KEY: ${API_KEY:?Set API_KEY before starting the service}
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+

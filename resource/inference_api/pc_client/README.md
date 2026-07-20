@@ -90,6 +90,10 @@ Select `Remote edge REST model` or `Cloud REST model` and provide an absolute
 inference URL. An optional API key is sent as a bearer token and is never
 returned by `/api/state`.
 
+The repository includes a deployment-ready implementation of this endpoint in
+[`../cloud_service/`](../cloud_service/README.md). It compiles deployment 19
+into the image and exports native inference, queue, and request timing metrics.
+
 The coordinator sends:
 
 ```json

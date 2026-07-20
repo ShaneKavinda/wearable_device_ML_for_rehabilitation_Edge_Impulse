@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(edge_inference_runner LANGUAGES C CXX)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,7 +68,11 @@ target_compile_definitions(edge_inference_runner PRIVATE
     EI_CLASSIFIER_TFLITE_ENABLE_CMSIS_NN=0
     EI_CLASSIFIER_TFLITE_ENABLE_ESP_NN=0
 )
+target_link_libraries(edge_inference_runner PRIVATE Threads::Threads)
 
 if(MINGW)
     target_link_options(edge_inference_runner PRIVATE -static -static-libgcc -static-libstdc++)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # Keep the Linux runtime image independent of a matching libstdc++ package.
+    target_link_options(edge_inference_runner PRIVATE -static-libgcc -static-libstdc++)
 endif()
