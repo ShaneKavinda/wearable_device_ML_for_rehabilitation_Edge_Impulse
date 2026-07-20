@@ -13,8 +13,13 @@ run inference and does not wait for a start command.
 | VIN / VCC | 3V3 |
 | GND | GND |
 
-The sketch assumes I2C address `0x68`. The default sample rate is 50 Hz. It can
-be changed with `SAMPLE_RATE_HZ`; the accepted range is 1-200 Hz.
+The sketch assumes I2C address `0x68`. The sample interval is fixed at 60,606 us
+(approximately 16.5 Hz), matching Edge Impulse project 738400 deployment 19. A
+different `SAMPLE_INTERVAL_US` intentionally fails compilation rather than
+silently feeding the wrong cadence to this experiment.
+The firmware resets the ICM-20948 during initialization so its full-scale ranges
+are deterministically `+/-2 g` and `+/-250 degrees/second`; this prevents stale
+sensor configuration from changing the feature scale.
 
 ## BLE interface
 
@@ -44,7 +49,7 @@ The reset-default sensor ranges are +/-2 g and +/-250 degrees/second:
 - acceleration in g = raw count / 16384
 - angular velocity in degrees/second = raw count / 131
 
-A future Python client can decode each Bleak notification with:
+The PC REST coordinator decodes each Bleak notification equivalently to:
 
 ```python
 import struct

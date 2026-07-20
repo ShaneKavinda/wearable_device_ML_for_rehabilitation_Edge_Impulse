@@ -18,7 +18,6 @@
 #define ICM20948_PWR_MGMT_2 0x07
 #define ICM20948_ACCEL_XOUT_H 0x2D
 #define ICM20948_GYRO_XOUT_H 0x33
-#define G_TO_MS2 9.80665f
 
 #ifndef CONFIDENCE_THRESHOLD
 #define CONFIDENCE_THRESHOLD 0.85f
@@ -36,6 +35,14 @@
 #error "This sketch expects 6 IMU axes per sample: acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z."
 #endif
 
+static_assert(EI_CLASSIFIER_PROJECT_ID == 738400, "Install Edge Impulse project 738400.");
+static_assert(EI_CLASSIFIER_PROJECT_DEPLOY_VERSION == 19, "Install deployment 19.");
+static_assert(EI_CLASSIFIER_RAW_SAMPLE_COUNT == 33, "Deployment 19 requires 33 samples.");
+static_assert(EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE == 198, "Deployment 19 requires 198 features.");
+static_assert(EI_CLASSIFIER_LABEL_COUNT == 6, "Deployment 19 requires six labels.");
+static_assert(EI_CLASSIFIER_FREQUENCY > 16.499 && EI_CLASSIFIER_FREQUENCY < 16.501,
+              "Deployment 19 requires a 16.5 Hz sampling rate.");
+
 #ifndef IMU_I2C_SDA
 #define IMU_I2C_SDA 5
 #endif
@@ -51,6 +58,7 @@ const char BLE_DEVICE_NAME[] = "IMU-Datastream";
 const char BLE_SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 const char BLE_RX_UUID[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 const char BLE_TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+const char BLE_RESULT_UUID[] = "6E400004-B5A3-F393-E0A9-E50E24DCCA9E";
 
 const char *GESTURE_LIST[] = {
     "Flexion",
@@ -99,9 +107,24 @@ struct ImuSample {
     float gz;
 };
 
+struct __attribute__((packed)) ResultPacket {
+    uint8_t version;
+    uint8_t deployment;
+    uint16_t flags;
+    uint32_t windowId;
+    uint32_t sourceSequence;
+    uint32_t inferenceUs;
+    uint16_t confidenceQ15;
+    uint8_t repetition;
+    uint8_t predictedClass;
+};
+
+static_assert(sizeof(ResultPacket) == 20, "ResultPacket must be exactly 20 bytes");
+
 float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
 String targetGesture = "";
 uint32_t windowId = 0;
+uint32_t sampleSequence = 0;
 bool imuReady = false;
 bool bleConnected = false;
 bool shouldRestartAdvertising = false;
@@ -110,8 +133,13 @@ bool resetRequested = false;
 bool sessionRunning = false;
 volatile bool stopRequested = false;
 volatile int pendingSelection = 0;
+volatile bool pendingCapture = false;
+volatile uint32_t pendingCaptureWindowId = 0;
+volatile int pendingCaptureSelection = 0;
+volatile int pendingCaptureRepetition = 0;
 
 BLECharacteristic *txCharacteristic = nullptr;
+BLECharacteristic *resultCharacteristic = nullptr;
 
 bool configureI2C();
 bool initICM20948();
@@ -123,8 +151,9 @@ bool readIMUData(ImuSample *sample);
 bool collectGestureData(InferenceResult *r);
 void runInference(InferenceResult *r, int repetition);
 void startGestureSession(int selection);
+void runSingleCapture(uint32_t requestedWindowId, int selection, int repetition);
 void initBLE();
-void handleCommand(char command);
+void handleCommandLine(const String &command);
 void handleSerialCommands();
 bool waitWithStop(uint32_t waitMs);
 void sendStartupStatus();
@@ -134,6 +163,8 @@ void sendStatusJson(const char *event, const char *message);
 void sendRepetitionEventJson(int repetition, const char *event);
 void sendSessionSummaryJson(InferenceResult history[], int total);
 void sendInferenceResultJson(int repetition, const InferenceResult &r);
+void sendBinaryResult(int repetition, const InferenceResult &r);
+int predictedClassIndex(const String &label);
 void appendScoresJson(String *out, const InferenceResult &r);
 void appendJsonString(String *out, const char *value);
 void appendJsonNullableInt(String *out, int32_t value);
@@ -155,6 +186,7 @@ class ServerCallbacks : public BLEServerCallbacks {
         bleConnected = false;
         stopRequested = true;
         pendingSelection = 0;
+        pendingCapture = false;
         shouldRestartAdvertising = true;
     }
 };
@@ -162,9 +194,8 @@ class ServerCallbacks : public BLEServerCallbacks {
 class RxCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *characteristic) override {
         String value = characteristic->getValue().c_str();
-        for (size_t i = 0; i < value.length(); i++) {
-            handleCommand(value.charAt(i));
-        }
+        value.trim();
+        handleCommandLine(value);
     }
 };
 
@@ -208,6 +239,18 @@ void loop() {
         startGestureSession(selection);
     }
 
+    if (pendingCapture && !sessionRunning) {
+        const uint32_t requestedWindowId = pendingCaptureWindowId;
+        const int requestedSelection = pendingCaptureSelection;
+        const int requestedRepetition = pendingCaptureRepetition;
+        pendingCapture = false;
+        runSingleCapture(
+            requestedWindowId,
+            requestedSelection,
+            requestedRepetition
+        );
+    }
+
     delay(20);
 }
 
@@ -225,6 +268,12 @@ void initBLE() {
         BLECharacteristic::PROPERTY_NOTIFY
     );
     txCharacteristic->addDescriptor(new BLE2902());
+
+    resultCharacteristic = service->createCharacteristic(
+        BLE_RESULT_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    resultCharacteristic->addDescriptor(new BLE2902());
 
     BLECharacteristic *rxCharacteristic = service->createCharacteristic(
         BLE_RX_UUID,
@@ -252,17 +301,46 @@ void initBLE() {
     Serial.println("BLE advertising as IMU-Datastream");
 }
 
-void handleCommand(char command) {
-    if (command == '\n' || command == '\r' || command == ' ' || command == '\t') {
+void handleCommandLine(const String &rawCommand) {
+    String command = rawCommand;
+    command.trim();
+    if (command.length() == 0) {
         return;
     }
 
-    if (command >= '0' && command <= '9') {
-        pendingSelection = command - '0';
+    unsigned long parsedWindowId = 0;
+    int requestedSelection = 0;
+    int requestedRepetition = 0;
+    if (sscanf(
+            command.c_str(),
+            "capture %lu %d %d",
+            &parsedWindowId,
+            &requestedSelection,
+            &requestedRepetition
+        ) == 3) {
+        if (requestedSelection < 1 || requestedSelection > NUM_GESTURES ||
+            requestedRepetition < 1 || requestedRepetition > SESSION_REPETITIONS) {
+            sendStatusJson("invalid_capture", "capture requires window_id, selection 1-6, repetition 1-10");
+            return;
+        }
+        if (sessionRunning || pendingCapture) {
+            sendStatusJson("busy", "capture_already_running");
+            return;
+        }
+        pendingCaptureWindowId = (uint32_t)parsedWindowId;
+        pendingCaptureSelection = requestedSelection;
+        pendingCaptureRepetition = requestedRepetition;
+        pendingCapture = true;
         return;
     }
 
-    switch (command) {
+    if (command.length() == 1 && command.charAt(0) >= '0' && command.charAt(0) <= '9') {
+        pendingSelection = command.charAt(0) - '0';
+        return;
+    }
+
+    const char first = command.charAt(0);
+    switch (first) {
         case 'm':
         case 'M':
         case 'h':
@@ -280,14 +358,26 @@ void handleCommand(char command) {
             sendStatusJson("stop_requested", "session_stop_requested");
             break;
         default:
-            sendStatusJson("unknown_command", "send 1-6 to start a gesture session, m for menu, r to reset, x to stop");
+            sendStatusJson("unknown_command", "send capture <window> <selection> <repetition>, 1-6 for legacy session, m, r, or x");
             break;
     }
 }
 
 void handleSerialCommands() {
+    static String serialCommand;
     while (Serial.available() > 0) {
-        handleCommand((char)Serial.read());
+        const char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (serialCommand.length() > 0) {
+                handleCommandLine(serialCommand);
+                serialCommand = "";
+            }
+        } else if (serialCommand.length() < 96) {
+            serialCommand += c;
+        } else {
+            serialCommand = "";
+            sendStatusJson("invalid_command", "command_too_long");
+        }
     }
 }
 
@@ -332,9 +422,12 @@ void startGestureSession(int selection) {
         if (!waitWithStop(1000)) break;
 
         sendRepetitionEventJson(i + 1, "movement_start");
+        windowId++;
         collectGestureData(&history[i]);
         sendRepetitionEventJson(i + 1, "sampling_finished");
         runInference(&history[i], i + 1);
+        sendBinaryResult(i + 1, history[i]);
+        sendInferenceResultJson(i + 1, history[i]);
         completed++;
 
         reinitializeSensor(false);
@@ -355,6 +448,36 @@ void startGestureSession(int selection) {
     sessionRunning = false;
     stopRequested = false;
     sendMenu();
+}
+
+void runSingleCapture(uint32_t requestedWindowId, int selection, int repetition) {
+    if (selection < 1 || selection > NUM_GESTURES) {
+        sendStatusJson("invalid_selection", "select_a_number_1_to_6");
+        return;
+    }
+
+    sessionRunning = true;
+    stopRequested = false;
+    targetGesture = GESTURE_LIST[selection - 1];
+    windowId = requestedWindowId;
+
+    if (!imuReady) {
+        imuReady = reinitializeSensor();
+    }
+    if (!imuReady) {
+        sendStatusJson("capture_failed", "imu_not_ready");
+        sessionRunning = false;
+        return;
+    }
+
+    InferenceResult result = {};
+    collectGestureData(&result);
+    runInference(&result, repetition);
+    sendBinaryResult(repetition, result);
+    sendInferenceResultJson(repetition, result);
+
+    sessionRunning = false;
+    stopRequested = false;
 }
 
 bool waitWithStop(uint32_t waitMs) {
@@ -501,15 +624,20 @@ bool collectGestureData(InferenceResult *r) {
             return false;
         }
 
-        features[featureIndex++] = sample.ax * G_TO_MS2;
-        features[featureIndex++] = sample.ay * G_TO_MS2;
-        features[featureIndex++] = sample.az * G_TO_MS2;
+        // Training data uses acceleration in g and gyro in degrees/second.
+        // The model's raw DSP scale is 1.0, so do not convert g to m/s^2.
+        features[featureIndex++] = sample.ax;
+        features[featureIndex++] = sample.ay;
+        features[featureIndex++] = sample.az;
         features[featureIndex++] = sample.gx;
         features[featureIndex++] = sample.gy;
         features[featureIndex++] = sample.gz;
 
-        while ((uint32_t)(micros() - sampleStartUs) < SAMPLE_INTERVAL_US) {
-            delayMicroseconds(50);
+        sampleSequence++;
+        if (sampleIndex + 1 < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+            while ((uint32_t)(micros() - sampleStartUs) < SAMPLE_INTERVAL_US) {
+                delayMicroseconds(50);
+            }
         }
     }
 
@@ -540,7 +668,6 @@ void runInference(InferenceResult *r, int repetition) {
     }
 
     if (collectFailed) {
-        sendInferenceResultJson(repetition, *r);
         return;
     }
 
@@ -561,7 +688,6 @@ void runInference(InferenceResult *r, int repetition) {
     r->errorCode = (int)res;
 
     if (res != EI_IMPULSE_OK) {
-        sendInferenceResultJson(repetition, *r);
         return;
     }
 
@@ -584,7 +710,6 @@ void runInference(InferenceResult *r, int repetition) {
     r->anomalyMs = result.timing.anomaly;
     r->correctLabel = r->label.equalsIgnoreCase(targetGesture);
 
-    sendInferenceResultJson(repetition, *r);
 }
 
 void sendStartupStatus() {
@@ -721,6 +846,43 @@ void sendSessionSummaryJson(InferenceResult history[], int total) {
     sendLine(line);
 }
 
+int predictedClassIndex(const String &label) {
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        if (label.equalsIgnoreCase(ei_classifier_inferencing_categories[ix])) {
+            return (int)ix;
+        }
+    }
+    return -1;
+}
+
+void sendBinaryResult(int repetition, const InferenceResult &r) {
+    if (!bleConnected || resultCharacteristic == nullptr) {
+        return;
+    }
+
+    ResultPacket packet = {};
+    packet.version = 1;
+    packet.deployment = 0;
+    packet.flags = 0;
+    if (r.ok) packet.flags |= 0x0001;
+    if (r.trusted) packet.flags |= 0x0002;
+    if (r.correctLabel) packet.flags |= 0x0004;
+    packet.windowId = windowId;
+    packet.sourceSequence = sampleSequence == 0 ? 0 : sampleSequence - 1;
+    packet.inferenceUs = r.inferenceEndUs - r.inferenceStartUs;
+    const float boundedConfidence = constrain(r.confidence, 0.0f, 1.0f);
+    packet.confidenceQ15 = (uint16_t)(boundedConfidence * 32767.0f + 0.5f);
+    packet.repetition = (uint8_t)constrain(repetition, 0, 255);
+    const int classIndex = predictedClassIndex(r.label);
+    packet.predictedClass = classIndex >= 0 ? (uint8_t)classIndex : 0xFF;
+
+    resultCharacteristic->setValue(
+        reinterpret_cast<uint8_t *>(&packet),
+        sizeof(packet)
+    );
+    resultCharacteristic->notify();
+}
+
 void sendInferenceResultJson(int repetition, const InferenceResult &r) {
     String line;
     line.reserve(1100);
@@ -729,7 +891,10 @@ void sendInferenceResultJson(int repetition, const InferenceResult &r) {
     line += ",\"repetition\":";
     line += String(repetition);
     line += ",\"window_id\":";
-    line += String(++windowId);
+    line += String(windowId);
+    line += ",\"deployment_id\":0";
+    line += ",\"source_sequence\":";
+    line += String(sampleSequence == 0 ? 0 : sampleSequence - 1);
     line += ",\"target\":";
     appendJsonString(&line, targetGesture.c_str());
     line += ",\"sample_count\":";

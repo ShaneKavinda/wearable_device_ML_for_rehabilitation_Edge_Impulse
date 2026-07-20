@@ -20,6 +20,14 @@
 #error "This sketch expects a 6-axis IMU model: acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z."
 #endif
 
+static_assert(EI_CLASSIFIER_PROJECT_ID == 738400, "Install Edge Impulse project 738400.");
+static_assert(EI_CLASSIFIER_PROJECT_DEPLOY_VERSION == 19, "Install deployment 19.");
+static_assert(EI_CLASSIFIER_RAW_SAMPLE_COUNT == 33, "Deployment 19 requires 33 samples.");
+static_assert(EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE == 198, "Deployment 19 requires 198 features.");
+static_assert(EI_CLASSIFIER_LABEL_COUNT == 6, "Deployment 19 requires six labels.");
+static_assert(EI_CLASSIFIER_FREQUENCY > 16.499 && EI_CLASSIFIER_FREQUENCY < 16.501,
+              "Deployment 19 requires a 16.5 Hz sampling rate.");
+
 const char DEVICE_ID[] = "xiao_esp32s3_001";
 const uint8_t XIAO_I2C_SDA = 5;        // XIAO ESP32S3 D4 / GPIO5
 const uint8_t XIAO_I2C_SCL = 6;        // XIAO ESP32S3 D5 / GPIO6
@@ -251,8 +259,10 @@ bool collectGestureData(WindowTiming *timing) {
         features[featureIndex++] = sample.gy;
         features[featureIndex++] = sample.gz;
 
-        while ((uint32_t)(micros() - sampleStartUs) < SAMPLE_INTERVAL_US) {
-            delayMicroseconds(50);
+        if (sampleIndex + 1 < EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+            while ((uint32_t)(micros() - sampleStartUs) < SAMPLE_INTERVAL_US) {
+                delayMicroseconds(50);
+            }
         }
     }
 

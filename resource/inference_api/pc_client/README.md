@@ -1,106 +1,175 @@
-# IMU Rehab PC API Hub
+# IMU Rehabilitation REST Coordinator
 
-The PC client is the hub between inference sources and remote clients. It owns
-source communication, exposes REST and WebSocket APIs, logs JSONL records, and
-serves a browser setup GUI.
+The Windows PC client is the only application layer. It connects to the IMU,
+invokes a selected model deployment, exposes a REST API and responsive web GUI,
+and writes benchmark/event logs. The phone needs only a web browser.
 
-## Install
+```mermaid
+flowchart LR
+    IMU["IMU source"] --> PC["PC client (REST coordinator)"]
+    PC <--> MODEL["Deployed model (local / edge / cloud)"]
+    PC --> LOG["Logging service"]
+    PC --> WEB["Responsive web GUI"]
+    WEB --> PHONE["Mobile browser"]
+```
+
+## Components
+
+- `imu_source.py`: continuous XIAO BLE IMU acquisition and 33-sample contiguous
+  green-window capture.
+- `model_backends.py`: local persistent C++ runner plus edge/cloud REST adapters.
+- `inference_protocol.py`: model labels and the fixed 20-byte result packet.
+- `datastream_client.py`: REST coordination, web pages, capture jobs, event feed,
+  configuration, and logging service.
+- `edge_runtime.py`: compatibility imports for older scripts; it is not the
+  active architecture.
+
+There is no Flutter application and no WebSocket endpoint.
+
+## Model-native sampling contract
+
+The checked-in Edge Impulse deployment is project `738400`, deployment `19`.
+Its exported metadata is the authority for inference sampling:
+
+- 33 samples at 16.5 Hz (`60.6060606 ms` per sample), nominally a two-second
+  window;
+- six values per sample and 198 float features per inference;
+- feature order `acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z`;
+- acceleration in **g** (`raw / 16384`) and angular velocity in **degrees/second**
+  (`raw / 131`);
+- raw DSP processing with `scale_axes=1.0`, so no g-to-m/s² conversion is
+  permitted before inference.
+
+The PC accepts only the next 33 packets after a green-light capture starts. It
+rejects sequence gaps, a mean timestamp cadence outside the model rate, and
+individual sampling stalls. Invalid attempts do not advance the repetition.
+
+## Install and run
+
+From this directory:
 
 ```powershell
-cd resource\inference_api\pc_client
-py -m pip install -r requirements.txt
+py -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe datastream_client.py serve --host 0.0.0.0 --port 8765
 ```
 
-## Run The API Hub
+On the PC, open `http://127.0.0.1:8765`, select `XIAO raw BLE IMU`, scan for
+`IMU-Raw-Stream`, configure the model deployment, and connect.
+
+On a phone on the same LAN, open:
+
+```text
+http://<pc-ip>:8765/mobile
+```
+
+The mobile page owns the motion menu, get-ready/countdown/green states, ten
+valid repetitions, Retry/Stop handling, HTTP result polling, and benchmark
+submission.
+
+## Model deployments
+
+Result and benchmark deployment IDs are `0=local`, `1=edge`, and `2=cloud`.
+
+### Local
+
+Select `Local PC runner` and set the built executable path. Build it with:
 
 ```powershell
-py datastream_client.py serve --host 0.0.0.0 --port 8765
+cd ..\edge_runner
+cmake -S . -B build -G "MinGW Makefiles"
+cmake --build build --config Release
 ```
 
-Open the setup GUI on the PC:
+The coordinator keeps the runner alive and speaks the existing `EIQ1`/`EIR1`
+binary protocol.
 
-```text
-http://127.0.0.1:8765
+### Edge or cloud
+
+Select `Remote edge REST model` or `Cloud REST model` and provide an absolute
+inference URL. An optional API key is sent as a bearer token and is never
+returned by `/api/state`.
+
+The coordinator sends:
+
+```json
+{
+  "version": 1,
+  "window_id": 42,
+  "feature_count": 198,
+  "features": [0.0],
+  "labels": [
+    "Extension",
+    "Flexion",
+    "Pronation",
+    "Radial Deviation",
+    "Supination",
+    "Ulnar Deviation"
+  ],
+  "warmup": false
+}
 ```
 
-From a phone on the same network, use the PC's LAN address:
+`features` contains exactly 198 float values in the model-native order and units
+listed above. The model endpoint returns either
+a six-value score list in model order or a label-to-score object:
 
-```text
-http://<pc-ip>:8765
+```json
+{
+  "ok": true,
+  "scores": {
+    "Extension": 0.05,
+    "Flexion": 0.80,
+    "Pronation": 0.05,
+    "Radial Deviation": 0.04,
+    "Supination": 0.03,
+    "Ulnar Deviation": 0.03
+  },
+  "inference_us": 1200,
+  "model_version": "deployment-19"
+}
 ```
 
-## Web GUI Scope
+Setup performs one request with `warmup: true` before measured captures.
 
-The browser GUI is only for PC-side setup and diagnostics:
-
-* choose the source type;
-* set serial port, baud, and log options;
-* connect or disconnect the active source;
-* inspect source health, record counts, and log path.
-
-Gesture/session operation is intentionally handled by the mobile app through the
-API.
-
-## Setup Flow
-
-1. Close Arduino Serial Monitor, Serial Plotter, PuTTY, Thonny, or anything else
-   using the COM port.
-2. Start the API hub.
-3. Open the web GUI.
-4. Set source to `edge_serial_beetle`, enter the COM port and baud, then connect.
-5. Open the Flutter app and connect it to `http://<pc-ip>:8765`.
-6. Start gesture sessions from the mobile app.
-
-The current source registry is future-ready, but only `edge_serial_beetle` is
-implemented.
-
-## API
-
-REST:
+## REST API
 
 ```text
+GET  /                         PC setup/dashboard
+GET  /mobile                   phone session UI
 GET  /api/health
 GET  /api/sources
 GET  /api/serial/ports
+GET  /api/ble/devices
 GET  /api/state
+GET  /api/events?after_id=0
 PUT  /api/config
 POST /api/source/connect
 POST /api/source/disconnect
-POST /api/source/request-menu
-POST /api/session/start
-POST /api/session/stop
+POST /api/captures              enqueue idempotent capture
+GET  /api/captures/{window_id}  poll capture state/result
+POST /api/capture               blocking compatibility endpoint
+POST /api/benchmarks/records
+GET  /api/benchmarks/summary
+GET  /api/benchmarks/export.csv
 GET  /api/logs
 ```
 
-WebSocket:
+`POST /api/captures` returns immediately. Repeating it with the same
+`window_id` is safe. Polling returns HTTP 202 while pending, HTTP 200 with the
+result, HTTP 409 for a failed capture, or HTTP 404 before the job exists.
 
-```text
-GET /ws/results
-```
+## Logging
 
-The WebSocket emits mobile-safe envelopes with these types:
+The logging service writes raw coordinator events to timestamped JSONL files
+and deduplicated benchmark records to `benchmark_records.jsonl`. The dashboard
+and CSV endpoint summarize capture, inference, end-to-end, and non-capture
+latency by deployment, gesture, and model version.
 
-```text
-state
-status
-session_start
-repetition_event
-inference_result
-session_summary
-metrics
-error
-```
+## Tests
 
-Raw serial lines and feature windows are not sent to mobile clients.
-
-## Run One Hardware Smoke Test
+From the repository root:
 
 ```powershell
-py datastream_client.py run-once --port COM13 --baud 115200 --gesture Flexion
-```
-
-## Test
-
-```powershell
-py -m unittest discover -s . -p test_*.py
+python -m unittest discover -s resource\inference_api\pc_client -p "test_*.py"
 ```

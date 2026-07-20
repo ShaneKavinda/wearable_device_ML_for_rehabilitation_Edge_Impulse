@@ -16,6 +16,7 @@
 #define ICM20948_PWR_MGMT_1 0x06
 #define ICM20948_PWR_MGMT_2 0x07
 #define ICM20948_ACCEL_XOUT_H 0x2D
+#define ICM20948_REG_BANK_SEL 0x7F
 
 #ifndef IMU_I2C_SDA
 #define IMU_I2C_SDA 5  // XIAO ESP32S3 D4 / GPIO5
@@ -25,12 +26,12 @@
 #define IMU_I2C_SCL 6  // XIAO ESP32S3 D5 / GPIO6
 #endif
 
-#ifndef SAMPLE_RATE_HZ
-#define SAMPLE_RATE_HZ 50
+#ifndef SAMPLE_INTERVAL_US
+#define SAMPLE_INTERVAL_US 60606UL
 #endif
 
-#if SAMPLE_RATE_HZ < 1 || SAMPLE_RATE_HZ > 200
-#error "SAMPLE_RATE_HZ must be between 1 and 200."
+#if SAMPLE_INTERVAL_US != 60606UL
+#error "Deployment 19 requires SAMPLE_INTERVAL_US=60606 (16.5 Hz)."
 #endif
 
 const char BLE_DEVICE_NAME[] = "IMU-Raw-Stream";
@@ -40,7 +41,6 @@ const char BLE_SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 const char BLE_TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
 const uint32_t I2C_FREQUENCY_HZ = 400000;
-const uint32_t SAMPLE_INTERVAL_US = 1000000UL / SAMPLE_RATE_HZ;
 const uint32_t SERIAL_WAIT_TIMEOUT_MS = 1500;
 const uint32_t IMU_RETRY_INTERVAL_MS = 2000;
 
@@ -169,8 +169,8 @@ void initBLE() {
     Serial.print("Advertising as ");
     Serial.print(BLE_DEVICE_NAME);
     Serial.print(" at ");
-    Serial.print(SAMPLE_RATE_HZ);
-    Serial.println(" Hz");
+    Serial.print(1000000.0f / (float)SAMPLE_INTERVAL_US, 3);
+    Serial.println(" Hz (model-native rate)");
 }
 
 void serviceStream() {
@@ -242,14 +242,29 @@ bool configureI2C() {
 }
 
 bool initICM20948() {
+    // REG_BANK_SEL is accessible from every bank. Force bank 0, then reset so
+    // the +/-2 g and +/-250 dps scale factors always match the training data,
+    // even if a previous firmware configured different full-scale ranges.
+    if (!writeRegister(ICM20948_REG_BANK_SEL, 0x00)) {
+        return false;
+    }
+
     uint8_t whoAmI = 0;
     if (!readRegisterBlock(ICM20948_WHO_AM_I, &whoAmI, 1) || whoAmI != 0xEA) {
         return false;
     }
 
+    if (!writeRegister(ICM20948_PWR_MGMT_1, 0x80)) {
+        return false;
+    }
+    delay(100);
+    if (!writeRegister(ICM20948_REG_BANK_SEL, 0x00)) {
+        return false;
+    }
+
     // Select the best available clock, leave sleep mode, then enable all
-    // accelerometer and gyroscope axes. Reset defaults are +/-2 g and
-    // +/-250 degrees/second, which match the scale factors above.
+    // accelerometer and gyroscope axes. The reset defaults are +/-2 g and
+    // +/-250 degrees/second, which match the model-native scale factors.
     if (!writeRegister(ICM20948_PWR_MGMT_1, 0x01)) {
         return false;
     }

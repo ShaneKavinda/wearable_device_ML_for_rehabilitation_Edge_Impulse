@@ -1,7 +1,9 @@
 # ESP32 BLE IMU Session Controller
 
 Arduino sketch for a Seeed Studio XIAO ESP32S3 with an ICM-20948 IMU. The
-ESP32 advertises over BLE, sends a gesture menu to the mobile app, waits for a
+This is legacy standalone onboard-inference firmware and is not used by the
+current PC REST architecture. The ESP32 advertises over BLE, sends a gesture
+menu to a compatible BLE client, waits for a
 task selection, collects IMU samples only during that task, runs the Edge
 Impulse classifier locally, and notifies the app with session progress and
 results.
@@ -35,6 +37,7 @@ layout:
 | Service | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` |
 | RX write | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` |
 | TX notify | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` |
+| Binary result notify | `6E400004-B5A3-F393-E0A9-E50E24DCCA9E` |
 
 Notifications are UTF-8 JSON lines split into 20-byte BLE-safe chunks. Rejoin
 chunks until `\n` to recover each full JSON message.
@@ -50,6 +53,7 @@ Write one of these commands to the RX characteristic:
 | Command | Behavior |
 | --- | --- |
 | `1` to `6` | Start a 10-repetition session for the selected gesture |
+| `capture <window_id> <selection> <repetition>` | Capture and infer one window immediately |
 | `m`, `h`, or `?` | Send the gesture menu again |
 | `r` | Reset/reinitialize the IMU |
 | `x` | Request the current session to stop |
@@ -123,6 +127,13 @@ Example inference result:
 ```
 
 Raw IMU features are not sent over BLE in the normal path.
+
+For a single capture, the result characteristic is notified before the JSON
+detail. Its 20-byte little-endian layout is `<BBHIIIHBB>`: protocol version,
+deployment (`0` onboard), flags (`ok`, `trusted`, `correct`), window ID, final
+sample sequence, inference microseconds, confidence Q15 (0-32767), repetition,
+and predicted class in model-label order. The command has no board-side
+countdown; a compatible controller must send it only after its green light.
 
 The Edge Impulse Arduino library that provides `ei_gesture_left_hand_imu.h` must
 be installed. The sketch uses its window size, sampling interval, and classifier

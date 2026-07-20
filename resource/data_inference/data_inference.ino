@@ -7,7 +7,14 @@
 #define ICM20948_PWR_MGMT_2 0x07
 #define ICM20948_ACCEL_XOUT_H 0x2D
 #define ICM20948_GYRO_XOUT_H 0x33
-#define G_TO_MS2 9.80665f 
+
+static_assert(EI_CLASSIFIER_PROJECT_ID == 738400, "Install Edge Impulse project 738400.");
+static_assert(EI_CLASSIFIER_PROJECT_DEPLOY_VERSION == 19, "Install deployment 19.");
+static_assert(EI_CLASSIFIER_RAW_SAMPLE_COUNT == 33, "Deployment 19 requires 33 samples.");
+static_assert(EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME == 6, "Deployment 19 requires six axes.");
+static_assert(EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE == 198, "Deployment 19 requires 198 features.");
+static_assert(EI_CLASSIFIER_FREQUENCY > 16.499 && EI_CLASSIFIER_FREQUENCY < 16.501,
+              "Deployment 19 requires a 16.5 Hz sampling rate.");
 
 const String GESTURE_LIST[] = {
   "Flexion", 
@@ -226,9 +233,11 @@ void collectGestureData() {
         unsigned long sampleStart = micros();
         readIMUData(&ax, &ay, &az, &gx, &gy, &gz);
         
-        features[featureIndex++] = ax * G_TO_MS2;
-        features[featureIndex++] = ay * G_TO_MS2;
-        features[featureIndex++] = az * G_TO_MS2;
+        // The training CSV columns are in g and degrees/second. The exported
+        // raw DSP block uses scale_axes=1.0, so preserve those units.
+        features[featureIndex++] = ax;
+        features[featureIndex++] = ay;
+        features[featureIndex++] = az;
         features[featureIndex++] = gx;
         features[featureIndex++] = gy;
         features[featureIndex++] = gz;

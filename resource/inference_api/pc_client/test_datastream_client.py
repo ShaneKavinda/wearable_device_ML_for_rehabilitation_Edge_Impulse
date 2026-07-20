@@ -1,10 +1,13 @@
 import asyncio
+import base64
 import importlib.util
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 
 MODULE_PATH = Path(__file__).with_name("datastream_client.py")
@@ -44,6 +47,82 @@ class FakeSource(datastream_client.InferenceSource):
         self.menu_requests += 1
 
 
+class FakeCaptureSource(datastream_client.InferenceSource):
+    source_type = "fake_capture"
+    display_name = "Fake capture source"
+    uses_line_reader = False
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def request_menu(self):
+        return None
+
+    async def capture_window(self, *, window_id, selection, repetition, target):
+        packet = datastream_client.pack_result_packet(
+            deployment=2,
+            window_id=window_id,
+            source_sequence=33,
+            inference_us=700,
+            confidence=0.9,
+            repetition=repetition,
+            predicted_class=1,
+            ok=True,
+            trusted=True,
+            correct=True,
+        )
+        return packet, {
+            "type": "inference_result",
+            "deployment_id": 2,
+            "window_id": window_id,
+            "repetition": repetition,
+            "target": target,
+            "predicted": "Flexion",
+            "correct": True,
+            "trusted": True,
+            "confidence": 0.9,
+            "collect_ms": 1940.0,
+            "inference_ms": 0.7,
+            "scores": {"Flexion": 0.9},
+        }
+
+
+class FailingEdgeSource(datastream_client.InferenceSource):
+    source_type = "failing_edge"
+
+    async def connect(self):
+        # Yield to make concurrent Connect requests overlap without a lock.
+        await asyncio.sleep(0)
+        raise datastream_client.ImuSourceError("incompatible BLE firmware")
+
+
+class FakeRawSource(datastream_client.InferenceSource):
+    source_type = "fake_raw"
+    display_name = "Fake raw IMU"
+    uses_line_reader = False
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def request_menu(self):
+        return None
+
+    async def capture_samples(self):
+        return SimpleNamespace(
+            features=lambda: [0.0] * 198,
+            source_sequence=55,
+            capture_ms=1940.0,
+            device_span_ms=1939.392,
+            mean_interval_ms=60.606,
+        )
+
+
 class ProtocolTest(unittest.TestCase):
     def test_resolves_gesture_by_number_and_case_insensitive_label(self):
         menu = beetle_menu()
@@ -60,7 +139,7 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(by_spaced_label.selection, 5)
         self.assertIsNone(datastream_client.resolve_gesture_selection(menu, "999"))
 
-    def test_mobile_envelope_excludes_raw_sensor_payloads(self):
+    def test_rest_envelope_excludes_raw_sensor_payloads(self):
         received_at = "2026-06-25T12:00:00+00:00"
         event = {
             "type": "inference_result",
@@ -73,7 +152,7 @@ class ProtocolTest(unittest.TestCase):
             "raw": "serial line",
         }
 
-        envelope = datastream_client.to_mobile_envelope(event, received_at)
+        envelope = datastream_client.to_rest_envelope(event, received_at)
 
         self.assertEqual(envelope["type"], "inference_result")
         self.assertEqual(envelope["received_at"], received_at)
@@ -133,9 +212,7 @@ class ApiHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.hub.session_running)
         self.assertEqual(FakeSource.instances[-1].sent_choices[0].selection, 1)
 
-    async def test_subscriber_receives_mobile_safe_result_and_metrics(self):
-        queue = self.hub.subscribe()
-
+    async def test_rest_event_feed_receives_safe_result_and_metrics(self):
         await self.hub.handle_serial_line(
             json_line(
                 {
@@ -150,8 +227,11 @@ class ApiHubTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        result_envelope = await next_envelope(queue, "inference_result")
-        metrics_envelope = await next_envelope(queue, "metrics")
+        events = self.hub.events_after()["events"]
+        result_envelope = next(
+            event for event in events if event["type"] == "inference_result"
+        )
+        metrics_envelope = next(event for event in events if event["type"] == "metrics")
 
         self.assertNotIn("features", result_envelope["data"])
         self.assertEqual(result_envelope["data"]["predicted"], "Flexion")
@@ -159,15 +239,82 @@ class ApiHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics_envelope["data"]["invalid_count"], 0)
 
     async def test_invalid_lines_increment_metrics_without_streaming_raw_line(self):
-        queue = self.hub.subscribe()
-
         await self.hub.handle_serial_line("not json")
-
-        metrics_envelope = await next_envelope(queue, "metrics")
+        metrics_envelope = next(
+            event
+            for event in self.hub.events_after()["events"]
+            if event["type"] == "metrics"
+        )
 
         self.assertEqual(metrics_envelope["data"]["valid_count"], 0)
         self.assertEqual(metrics_envelope["data"]["invalid_count"], 1)
         self.assertNotIn("raw", json.dumps(metrics_envelope))
+
+    async def test_concurrent_failed_connects_are_serialized_and_cleaned_up(self):
+        hub = datastream_client.ApiHub({FailingEdgeSource.source_type: FailingEdgeSource})
+        hub.configure(
+            {
+                "source_type": FailingEdgeSource.source_type,
+                "log_dir": self.temp_dir.name,
+            }
+        )
+
+        results = await asyncio.gather(
+            hub.connect(),
+            hub.connect(),
+            return_exceptions=True,
+        )
+
+        self.assertTrue(
+            all(isinstance(result, datastream_client.ClientError) for result in results)
+        )
+        self.assertEqual(
+            [str(result) for result in results],
+            ["incompatible BLE firmware", "incompatible BLE firmware"],
+        )
+        self.assertIsNone(hub._source)
+        self.assertIsNone(hub._logging)
+        self.assertEqual(hub.last_error, "incompatible BLE firmware")
+
+    async def test_raw_imu_and_model_backend_are_coordinated_separately(self):
+        backend = SimpleNamespace(
+            deployment_id=0,
+            start=AsyncMock(),
+            close=AsyncMock(),
+            classify=AsyncMock(
+                return_value=SimpleNamespace(
+                    scores=(0.05, 0.8, 0.05, 0.04, 0.03, 0.03),
+                    inference_us=600,
+                    backend="local",
+                    model_version="19",
+                )
+            ),
+        )
+        hub = datastream_client.ApiHub({FakeRawSource.source_type: FakeRawSource})
+        hub.configure(
+            {
+                "source_type": FakeRawSource.source_type,
+                "model_backend": "local",
+                "log_dir": self.temp_dir.name,
+            }
+        )
+        with patch.object(
+            datastream_client,
+            "create_model_backend",
+            return_value=backend,
+        ):
+            await hub.connect()
+            detail = await hub.capture(
+                {"window_id": 77, "selection": 1, "repetition": 1}
+            )
+            await hub.disconnect()
+
+        backend.start.assert_awaited_once()
+        backend.classify.assert_awaited_once()
+        backend.close.assert_awaited_once()
+        self.assertEqual(detail["deployment"], "local")
+        self.assertEqual(detail["predicted"], "Flexion")
+        self.assertEqual(detail["source_sequence"], 55)
 
 
 @unittest.skipUnless(
@@ -191,6 +338,11 @@ class RestApiTest(unittest.TestCase):
             health = client.get("/api/health")
             self.assertEqual(health.status_code, 200)
             self.assertTrue(health.json()["ok"])
+            self.assertEqual(health.json()["transport"], "rest")
+            self.assertEqual(health.json()["model_backends"], ["local", "edge", "cloud"])
+            self.assertEqual(health.json()["model_contract"]["project_id"], 738400)
+            self.assertEqual(health.json()["model_contract"]["sample_count"], 33)
+            self.assertEqual(health.json()["model_contract"]["units"][0], "g")
 
             config = client.put(
                 "/api/config",
@@ -203,36 +355,161 @@ class RestApiTest(unittest.TestCase):
             )
             self.assertEqual(config.status_code, 200)
             self.assertEqual(config.json()["config"]["port"], "COM13")
+            self.assertEqual(config.json()["config"]["model_backend"], "local")
+            self.assertNotIn("model_api_key", config.json()["config"])
 
             state = client.get("/api/state")
             self.assertEqual(state.status_code, 200)
             self.assertFalse(state.json()["connected"])
 
-    def test_websocket_results_accepts_and_sends_initial_state(self):
+    def test_rest_event_feed_exposes_state_changes(self):
         try:
             from fastapi.testclient import TestClient
         except ImportError:
             self.skipTest("FastAPI TestClient is not installed")
 
-        hub = datastream_client.ApiHub(
-            {datastream_client.DEFAULT_SOURCE_TYPE: FakeSource}
-        )
-        app = datastream_client.create_app(hub)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = datastream_client.ApiHub(
+                {datastream_client.DEFAULT_SOURCE_TYPE: FakeSource}
+            )
+            hub.configure(
+                {
+                    "source_type": datastream_client.DEFAULT_SOURCE_TYPE,
+                    "log_dir": temp_dir,
+                }
+            )
+            app = datastream_client.create_app(hub)
+            client = TestClient(app)
+
+            self.assertEqual(client.post("/api/source/connect").status_code, 200)
+            feed = client.get("/api/events?after_id=0").json()
+            self.assertTrue(any(event["type"] == "state" for event in feed["events"]))
+            self.assertGreater(feed["latest_event_id"], 0)
+            self.assertEqual(client.post("/api/source/disconnect").status_code, 200)
+
+    def test_http_capture_returns_durable_packet_and_detail(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = datastream_client.ApiHub({"fake_capture": FakeCaptureSource})
+            hub.configure({"source_type": "fake_capture", "log_dir": temp_dir})
+            client = TestClient(datastream_client.create_app(hub))
+            self.assertEqual(client.post("/api/source/connect").status_code, 200)
+
+            response = client.post(
+                "/api/capture",
+                json={
+                    "type": "capture",
+                    "window_id": 43,
+                    "selection": 1,
+                    "repetition": 1,
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            packet = base64.b64decode(body["packet_base64"])
+            self.assertEqual(
+                datastream_client.unpack_result_packet(packet).window_id,
+                43,
+            )
+            self.assertEqual(body["detail"]["collect_ms"], 1940.0)
+            cached = client.get("/api/captures/43")
+            self.assertEqual(cached.status_code, 200)
+            self.assertEqual(cached.json(), body)
+            self.assertEqual(client.get("/api/captures/999").status_code, 404)
+            self.assertEqual(client.post("/api/source/disconnect").status_code, 200)
+
+    def test_queued_http_capture_is_idempotent_and_pollable(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = datastream_client.ApiHub({"fake_capture": FakeCaptureSource})
+            hub.configure({"source_type": "fake_capture", "log_dir": temp_dir})
+            with TestClient(datastream_client.create_app(hub)) as client:
+                self.assertEqual(client.post("/api/source/connect").status_code, 200)
+                payload = {
+                    "type": "capture",
+                    "window_id": 44,
+                    "selection": 1,
+                    "repetition": 1,
+                }
+                first = client.post("/api/captures", json=payload)
+                second = client.post("/api/captures", json=payload)
+                self.assertEqual(first.status_code, 202)
+                self.assertEqual(second.status_code, 202)
+
+                result = None
+                for _ in range(20):
+                    response = client.get("/api/captures/44")
+                    if response.status_code == 200:
+                        result = response.json()
+                        break
+                self.assertIsNotNone(result)
+                self.assertEqual(result["status"], "complete")
+                self.assertEqual(result["detail"]["window_id"], 44)
+                self.assertEqual(hub.stats.valid_count, 1)
+                self.assertEqual(client.post("/api/source/disconnect").status_code, 200)
+
+    def test_mobile_session_page_uses_http_polling_without_websocket(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
+
+        app = datastream_client.create_app()
         client = TestClient(app)
+        response = client.get("/mobile")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("/api/captures", response.text)
+        self.assertIn("Start 10 repetitions", response.text)
+        self.assertNotIn("new WebSocket", response.text)
+        self.assertNotIn("/ws/results", {route.path for route in app.routes})
+        dashboard = client.get("/")
+        self.assertIn('id="modelBackend"', dashboard.text)
+        self.assertIn("/api/events", dashboard.text)
 
-        with client.websocket_connect("/ws/results") as websocket:
-            envelope = websocket.receive_json()
+    def test_benchmark_deduplication_summary_and_csv_export(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
 
-        self.assertEqual(envelope["type"], "state")
-        self.assertFalse(envelope["data"]["connected"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = datastream_client.ApiHub()
+            hub.configure({"log_dir": temp_dir})
+            client = TestClient(datastream_client.create_app(hub))
+            record = {
+                "type": "benchmark_record",
+                "session_id": "session-a",
+                "deployment_id": 1,
+                "gesture": "Flexion",
+                "window_id": 7,
+                "repetition": 1,
+                "correct": True,
+                "confidence": 0.9,
+                "capture_ms": 1940,
+                "inference_ms": 2,
+                "end_to_end_ms": 1950,
+                "non_capture_ms": 8,
+            }
+            first = client.post("/api/benchmarks/records", json=record).json()
+            second = client.post("/api/benchmarks/records", json=record).json()
 
-
-async def next_envelope(queue, envelope_type):
-    for _ in range(10):
-        envelope = await asyncio.wait_for(queue.get(), timeout=0.5)
-        if envelope["type"] == envelope_type:
-            return envelope
-    raise AssertionError(f"Did not receive envelope type {envelope_type}")
+            self.assertTrue(first["created"])
+            self.assertFalse(second["created"])
+            summary = client.get("/api/benchmarks/summary").json()
+            self.assertEqual(summary["record_count"], 1)
+            self.assertEqual(summary["groups"][0]["accuracy"], 1.0)
+            export = client.get("/api/benchmarks/export.csv")
+            self.assertEqual(export.status_code, 200)
+            self.assertIn("session-a", export.text)
 
 
 def beetle_menu():
