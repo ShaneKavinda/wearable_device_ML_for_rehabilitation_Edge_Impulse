@@ -65,14 +65,23 @@ and the six labels in model order. It rejects unknown JSON fields and bodies ove
   },
   "inference_us": 1200,
   "model_version": "ei-738400-deployment-19",
-  "timing_us": {"queue": 10, "inference": 1200, "server": 1300}
+  "timing_us": {"queue": 10, "inference": 1200, "server": 1300},
+  "resource_usage": {
+    "service_rss_bytes": 51000000,
+    "runner_rss_bytes": 9000000,
+    "process_tree_rss_bytes": 60000000,
+    "process_tree_peak_rss_bytes": 61000000,
+    "request_cpu_us": 1400
+  }
 }
 ```
 
 `inference_us` measures native DSP plus classifier execution. `queue` is time
 waiting for the single model process, and `server` includes both. The PC client
-independently measures the HTTP wall time, so network overhead is the difference
-between its wall time and the reported server time.
+independently records HTTP wall time. It reports `max(0, HTTP wall - server)` as
+a **transport residual**, which includes network, TLS, proxy, serialization,
+and client scheduling effects and is not pure network latency. Resource
+telemetry is optional and never makes inference fail.
 
 ## Cloud deployment
 
@@ -112,6 +121,17 @@ Prometheus text metrics are available at `/metrics` with the bearer key:
 - `imu_cloud_inference_requests_total`: success/error counts, split by warm-up;
 - `imu_cloud_inferences_in_progress` and `imu_cloud_runner_up`;
 - `imu_cloud_startup_seconds` and `imu_cloud_model_info`.
+- `imu_cloud_inference_http_requests_total`, split by HTTP status class;
+- `imu_cloud_request_body_bytes` and `imu_cloud_response_body_bytes`;
+- `imu_cloud_request_cpu_seconds`;
+- `imu_cloud_process_resident_memory_bytes`,
+  `imu_cloud_process_peak_resident_memory_bytes`, and
+  `imu_cloud_process_cpu_seconds`, split by service/runner/tree scope; and
+- `imu_cloud_runner_restarts_total`.
+
+The supplied Kubernetes manifest includes Prometheus pod annotations. `/metrics`
+still requires the bearer key: configure Prometheus with the existing
+`imu-rehab-inference` Secret rather than making metrics public.
 
 Use histogram rates to calculate a p95, for example:
 

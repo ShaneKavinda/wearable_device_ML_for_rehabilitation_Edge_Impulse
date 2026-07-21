@@ -254,6 +254,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: $AppName
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8080"
     spec:
       terminationGracePeriodSeconds: 15
       securityContext:
@@ -880,6 +884,22 @@ platforms.
 8. Export `/metrics` after each run and label the saved file with platform,
    region/cluster, container limits, image tag or digest, concurrency, and UTC
    timestamp.
+9. Set the same values in the PC dashboard's **Experiment Profile** before the
+   mobile session starts. The profile is snapshotted into every attempt record.
+10. In another PowerShell terminal, collect Rahti's container working set and
+    Pod status from the Metrics API:
+
+    ```powershell
+    .\resource\inference_api\cloud_service\collect_rahti_metrics.ps1 `
+      -Namespace $RahtiProject `
+      -RunLabel "rahti-wifi-1cpu-512m" `
+      -IntervalSeconds 2 `
+      -OutputDirectory .\metrics
+    ```
+
+    Stop with Ctrl+C. Pair the collector CSV with the benchmark export by run
+    label and UTC timestamps. Metrics API memory is the container working set;
+    the inference response reports application-process RSS instead.
 
 Important service metrics include:
 
@@ -891,6 +911,14 @@ imu_cloud_inference_requests_total
 imu_cloud_inferences_in_progress
 imu_cloud_startup_seconds
 imu_cloud_model_info
+imu_cloud_inference_http_requests_total
+imu_cloud_request_body_bytes
+imu_cloud_response_body_bytes
+imu_cloud_request_cpu_seconds
+imu_cloud_process_resident_memory_bytes
+imu_cloud_process_peak_resident_memory_bytes
+imu_cloud_process_cpu_seconds
+imu_cloud_runner_restarts_total
 ```
 
 For Prometheus, steady-state p95 native inference latency can be calculated with:
@@ -899,6 +927,38 @@ For Prometheus, steady-state p95 native inference latency can be calculated with
 histogram_quantile(0.95,
   sum by (le) (rate(imu_cloud_inference_seconds_bucket[5m])))
 ```
+
+The Deployment contains `prometheus.io/scrape`, `prometheus.io/path`, and
+`prometheus.io/port` annotations. Because `/metrics` remains protected, mount
+the `imu-rehab-inference` Secret into the Prometheus Pod and configure the scrape
+job with `authorization.credentials_file` pointing to its `api-key` file. Do
+not place the key directly in Prometheus YAML or labels.
+
+When the OpenShift monitoring data source exposes Kubernetes/container metrics,
+use these queries alongside the application metrics:
+
+```promql
+# Container CPU cores
+rate(container_cpu_usage_seconds_total{namespace="<namespace>",container="inference"}[5m])
+
+# Container working-set memory
+container_memory_working_set_bytes{namespace="<namespace>",container="inference"}
+
+# CPU throttling ratio
+rate(container_cpu_cfs_throttled_periods_total{namespace="<namespace>",container="inference"}[5m])
+/
+rate(container_cpu_cfs_periods_total{namespace="<namespace>",container="inference"}[5m])
+
+# Restarts and previous OOM termination
+kube_pod_container_status_restarts_total{namespace="<namespace>",container="inference"}
+kube_pod_container_status_last_terminated_reason{
+  namespace="<namespace>",container="inference",reason="OOMKilled"
+}
+```
+
+The basic Metrics API used by the collector does not expose CPU throttling. If
+the cluster Prometheus data source is unavailable, leave throttling unreported
+rather than estimating it from CPU utilization.
 
 Do not put the API key in benchmark CSV files, screenshots, shell transcripts,
 or Prometheus labels.

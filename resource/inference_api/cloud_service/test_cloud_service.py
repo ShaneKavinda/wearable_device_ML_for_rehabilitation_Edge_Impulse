@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
+import psutil
 
 from resource.inference_api.cloud_service.app import (
     MODEL_LABELS,
@@ -115,6 +117,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         denied = await self.client.post("/v1/infer", json=request_payload())
         self.assertEqual(health.status_code, 200)
         self.assertEqual(denied.status_code, 401)
+        metrics = await self.client.get(
+            "/metrics",
+            headers={"Authorization": "Bearer test-secret-value"},
+        )
+        self.assertIn(
+            'imu_cloud_inference_http_requests_total{status_class="4xx"} 1.0',
+            metrics.text,
+        )
 
     async def test_inference_and_prometheus_metrics(self) -> None:
         headers = {"Authorization": "Bearer test-secret-value"}
@@ -131,7 +141,20 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["inference_us"], 1200)
         self.assertEqual(list(body["scores"]), list(MODEL_LABELS))
         self.assertEqual(body["timing_us"]["queue"], 25)
+        self.assertIn("process_tree_rss_bytes", body["resource_usage"])
+        self.assertIn("request_cpu_us", body["resource_usage"])
         self.assertIn("imu_cloud_inference_seconds_count 1", metrics.text)
+        self.assertIn("imu_cloud_request_body_bytes_count 1", metrics.text)
+        self.assertIn("imu_cloud_response_body_bytes_count 1", metrics.text)
+        self.assertIn("imu_cloud_request_cpu_seconds_count 1", metrics.text)
+        self.assertIn("imu_cloud_process_resident_memory_bytes", metrics.text)
+        self.assertIn("imu_cloud_process_peak_resident_memory_bytes", metrics.text)
+        self.assertIn("imu_cloud_process_cpu_seconds", metrics.text)
+        self.assertIn("imu_cloud_runner_restarts_total", metrics.text)
+        self.assertIn(
+            'imu_cloud_inference_http_requests_total{status_class="2xx"} 1.0',
+            metrics.text,
+        )
         self.assertIn(
             'imu_cloud_inference_requests_total{outcome="success",warmup="false"} 1.0',
             metrics.text,
@@ -141,6 +164,22 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/readyz")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["ok"])
+
+    async def test_resource_sampling_failure_does_not_fail_inference(self) -> None:
+        headers = {"Authorization": "Bearer test-secret-value"}
+        with patch(
+            "resource.inference_api.cloud_service.app.psutil.Process",
+            side_effect=psutil.NoSuchProcess(999),
+        ):
+            response = await self.client.post(
+                "/v1/infer",
+                headers=headers,
+                json=request_payload(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["resource_usage"]["process_tree_rss_bytes"])
+        self.assertIsNone(response.json()["resource_usage"]["request_cpu_us"])
 
 
 @unittest.skipUnless(WINDOWS_RUNNER.is_file(), "local native runner is not built")

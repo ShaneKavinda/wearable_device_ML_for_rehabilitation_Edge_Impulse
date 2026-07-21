@@ -156,6 +156,8 @@ POST /api/capture               blocking compatibility endpoint
 POST /api/benchmarks/records
 GET  /api/benchmarks/summary
 GET  /api/benchmarks/export.csv
+GET  /api/experiment-profile
+PUT  /api/experiment-profile
 GET  /api/logs
 ```
 
@@ -166,9 +168,18 @@ result, HTTP 409 for a failed capture, or HTTP 404 before the job exists.
 ## Logging
 
 The logging service writes raw coordinator events to timestamped JSONL files
-and deduplicated benchmark records to `benchmark_records.jsonl`. The dashboard
-and CSV endpoint summarize capture, inference, end-to-end, and non-capture
-latency by deployment, gesture, and model version.
+and deduplicated benchmark records to `benchmark_records.jsonl`. Schema-v2 rows
+record every success, error, timeout, or cancelled attempt together with the
+experiment profile, post-capture and backend timing decomposition, HTTP payload
+sizes, and process CPU/RSS observations. Existing rows remain readable and are
+treated as successful records with unknown experiment context.
+
+The dashboard and CSV endpoint report attempt/success/deadline rates and
+p50/p95/p99 distributions. `transport_residual_ms` is HTTP wall time minus
+server time; it includes network, TLS, routing, serialization, and client
+scheduling and must not be labelled as pure network latency. The legacy
+`non_capture_ms` field is retained for compatibility but remains a mixed
+end-to-end residual.
 
 ## Tests
 

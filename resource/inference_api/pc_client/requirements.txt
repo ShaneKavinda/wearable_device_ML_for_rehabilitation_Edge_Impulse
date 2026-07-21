@@ -2,3 +2,4 @@ fastapi
 uvicorn
 pyserial
 bleak
+psutil>=6.1,<8

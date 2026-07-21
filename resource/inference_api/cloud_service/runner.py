@@ -38,10 +38,19 @@ class EdgeImpulseRunner:
         self.timeout_s = timeout_s
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
+        self._start_count = 0
 
     @property
     def is_running(self) -> bool:
         return self._process is not None and self._process.returncode is None
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid if self._process is not None else None
+
+    @property
+    def restart_count(self) -> int:
+        return max(0, self._start_count - 1)
 
     async def start(self) -> None:
         if self.is_running:
@@ -60,6 +69,7 @@ class EdgeImpulseRunner:
                 stderr=None,
                 creationflags=creationflags,
             )
+            self._start_count += 1
         except OSError as error:
             raise RunnerError(f"Could not start the inference runner: {error}") from error
 

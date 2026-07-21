@@ -1,6 +1,8 @@
 import asyncio
 import base64
+import csv
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -315,6 +317,13 @@ class ApiHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["deployment"], "local")
         self.assertEqual(detail["predicted"], "Flexion")
         self.assertEqual(detail["source_sequence"], 55)
+        self.assertGreaterEqual(detail["post_capture_ms"], 0)
+        self.assertGreaterEqual(detail["pc_pipeline_ms"], detail["post_capture_ms"])
+        self.assertGreater(detail["pc_rss_bytes"], 0)
+        self.assertEqual(
+            detail["experiment_profile"]["feedback_deadline_ms"],
+            500.0,
+        )
 
 
 @unittest.skipUnless(
@@ -491,6 +500,49 @@ class RestApiTest(unittest.TestCase):
             "$('modelUrl').value = state.config?.model_url || '';",
             dashboard,
         )
+        self.assertIn("dirtyExperimentFields", dashboard)
+        self.assertIn("renderExperimentProfile", dashboard)
+        self.assertIn('id="benchmarkRows"', dashboard)
+
+        mobile = datastream_client.mobile_session_html()
+        self.assertIn("profileSnapshot = Object.freeze", mobile)
+        self.assertIn("pendingBenchmarkRecords", mobile)
+        self.assertIn("saveFailedBenchmark", mobile)
+        self.assertIn("post-capture", mobile)
+
+    def test_experiment_profile_validation_and_state(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
+
+        client = TestClient(datastream_client.create_app())
+        response = client.put(
+            "/api/experiment-profile",
+            json={
+                "experiment_label": "rahti-wifi",
+                "network_profile": "campus Wi-Fi",
+                "platform": "Rahti",
+                "region": "2.rahti",
+                "cpu_limit_millicores": 1000,
+                "memory_limit_mib": 512,
+                "concurrency": 4,
+                "run_type": "steady_state",
+                "feedback_deadline_ms": 500,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["concurrency"], 4)
+        self.assertEqual(
+            client.get("/api/state").json()["experiment_profile"]["experiment_label"],
+            "rahti-wifi",
+        )
+        invalid = client.put(
+            "/api/experiment-profile",
+            json={"run_type": "sometimes", "concurrency": 1},
+        )
+        self.assertEqual(invalid.status_code, 400)
 
     def test_benchmark_deduplication_summary_and_csv_export(self):
         try:
@@ -527,6 +579,97 @@ class RestApiTest(unittest.TestCase):
             export = client.get("/api/benchmarks/export.csv")
             self.assertEqual(export.status_code, 200)
             self.assertIn("session-a", export.text)
+
+    def test_benchmark_v2_success_failure_percentiles_and_nullable_export(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("FastAPI TestClient is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hub = datastream_client.ApiHub()
+            hub.configure({"log_dir": temp_dir})
+            client = TestClient(datastream_client.create_app(hub))
+            base = {
+                "type": "benchmark_record",
+                "session_id": "session-v2",
+                "deployment": "cloud",
+                "deployment_id": 2,
+                "gesture": "Flexion",
+                "model_version": "cloud-19",
+                "repetition": 1,
+                "experiment_label": "rahti-wifi",
+                "network_profile": "campus Wi-Fi",
+                "platform": "Rahti",
+                "region": "2.rahti",
+                "concurrency": 1,
+                "run_type": "steady_state",
+                "feedback_deadline_ms": 500,
+            }
+            success = {
+                **base,
+                "window_id": 70,
+                "attempt": 1,
+                "outcome": "success",
+                "correct": True,
+                "trusted": True,
+                "confidence": 0.9,
+                "post_capture_ms": 120,
+                "backend_wall_ms": 40,
+                "server_ms": 10,
+                "transport_residual_ms": 30,
+                "backend_peak_rss_bytes": 64000000,
+            }
+            failure = {
+                **base,
+                "window_id": 71,
+                "attempt": 2,
+                "outcome": "timeout",
+                "error_code": "model_timeout",
+            }
+            self.assertEqual(client.post("/api/benchmarks/records", json=success).status_code, 200)
+            self.assertEqual(client.post("/api/benchmarks/records", json=failure).status_code, 200)
+
+            group = client.get("/api/benchmarks/summary").json()["groups"][0]
+            self.assertEqual(group["attempt_count"], 2)
+            self.assertEqual(group["success_count"], 1)
+            self.assertEqual(group["timeout_count"], 1)
+            self.assertEqual(group["deadline_misses"], 0)
+            self.assertEqual(group["post_capture_ms"]["p99"], 120)
+            self.assertEqual(group["peak_backend_rss_bytes"], 64000000)
+
+            exported = client.get("/api/benchmarks/export.csv").text
+            rows = list(csv.DictReader(io.StringIO(exported)))
+            failed_row = next(row for row in rows if row["outcome"] == "timeout")
+            self.assertEqual(failed_row["post_capture_ms"], "")
+            self.assertEqual(failed_row["error_code"], "model_timeout")
+
+    def test_legacy_benchmark_row_is_read_without_migration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = datastream_client.BenchmarkStore(Path(temp_dir))
+            legacy = {
+                "session_id": "legacy",
+                "deployment": "local",
+                "deployment_id": 0,
+                "gesture": "Flexion",
+                "model_version": "19",
+                "window_id": 1,
+                "repetition": 1,
+                "correct": True,
+                "confidence": 0.9,
+                "capture_ms": 1940,
+                "inference_ms": 2,
+                "end_to_end_ms": 1950,
+                "non_capture_ms": 8,
+            }
+            store.path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+            summary = store.summary()
+
+            self.assertEqual(summary["record_count"], 1)
+            self.assertEqual(summary["groups"][0]["success_count"], 1)
+            self.assertEqual(summary["groups"][0]["accuracy"], 1.0)
+            self.assertNotIn("schema_version", store.records()[0])
 
 
 def beetle_menu():

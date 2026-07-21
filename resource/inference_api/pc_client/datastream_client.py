@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -15,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, IO, Optional, Sequence
 
+import psutil
+
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
@@ -22,6 +25,8 @@ if str(MODULE_DIR) not in sys.path:
 from imu_source import (  # noqa: E402
     GESTURE_MENU,
     ImuSourceError,
+    SamplingContractError,
+    SequenceGapError,
     XiaoBleImuSource,
     ble_runtime_status,
     scan_ble_devices,
@@ -88,6 +93,10 @@ REST_EVENT_TYPES = {
 
 class ClientError(Exception):
     """Expected client-side error that should be shown without a traceback."""
+
+    def __init__(self, message: str, *, error_code: str = "client_error") -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 @dataclass
@@ -164,6 +173,86 @@ class SourceConfig:
             "model_timeout_s": self.model_timeout_s,
             "model_version": self.model_version,
         }
+
+
+@dataclass(frozen=True)
+class ExperimentProfile:
+    experiment_label: str = "unspecified"
+    network_profile: str = "unspecified"
+    platform: str = "unspecified"
+    region: str = "unspecified"
+    cpu_limit_millicores: int | None = None
+    memory_limit_mib: int | None = None
+    concurrency: int = 1
+    run_type: str = "steady_state"
+    feedback_deadline_ms: float = 500.0
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ExperimentProfile":
+        run_type = _profile_text(payload.get("run_type", "steady_state"), "run_type")
+        if run_type not in {"steady_state", "cold_start"}:
+            raise ClientError("run_type must be steady_state or cold_start.")
+        concurrency = _profile_int(payload.get("concurrency", 1), "concurrency", 1, 1000)
+        deadline = _bounded_float(
+            payload.get("feedback_deadline_ms", 500.0),
+            "feedback_deadline_ms",
+            1.0,
+            120000.0,
+        )
+        return cls(
+            experiment_label=_profile_text(
+                payload.get("experiment_label", "unspecified"),
+                "experiment_label",
+            ),
+            network_profile=_profile_text(
+                payload.get("network_profile", "unspecified"),
+                "network_profile",
+            ),
+            platform=_profile_text(payload.get("platform", "unspecified"), "platform"),
+            region=_profile_text(payload.get("region", "unspecified"), "region"),
+            cpu_limit_millicores=_optional_profile_int(
+                payload.get("cpu_limit_millicores"),
+                "cpu_limit_millicores",
+            ),
+            memory_limit_mib=_optional_profile_int(
+                payload.get("memory_limit_mib"),
+                "memory_limit_mib",
+            ),
+            concurrency=concurrency,
+            run_type=run_type,
+            feedback_deadline_ms=deadline,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "experiment_label": self.experiment_label,
+            "network_profile": self.network_profile,
+            "platform": self.platform,
+            "region": self.region,
+            "cpu_limit_millicores": self.cpu_limit_millicores,
+            "memory_limit_mib": self.memory_limit_mib,
+            "concurrency": self.concurrency,
+            "run_type": self.run_type,
+            "feedback_deadline_ms": self.feedback_deadline_ms,
+        }
+
+
+@dataclass(frozen=True)
+class _ProcessPoint:
+    rss_bytes: int
+    cpu_seconds: float
+
+
+def _current_process_point() -> _ProcessPoint | None:
+    try:
+        process = psutil.Process(os.getpid())
+        cpu = process.cpu_times()
+        return _ProcessPoint(
+            rss_bytes=int(process.memory_info().rss),
+            cpu_seconds=float(cpu.user) + float(cpu.system),
+        )
+    except (psutil.Error, OSError, ValueError):
+        return None
 
 
 class JsonlLogger:
@@ -323,6 +412,36 @@ class BenchmarkStore:
         "end_to_end_ms",
         "non_capture_ms",
         "recorded_at",
+        "schema_version",
+        "outcome",
+        "error_code",
+        "predicted",
+        "trusted",
+        "experiment_label",
+        "network_profile",
+        "platform",
+        "region",
+        "cpu_limit_millicores",
+        "memory_limit_mib",
+        "concurrency",
+        "run_type",
+        "feedback_deadline_ms",
+        "post_capture_ms",
+        "pc_pipeline_ms",
+        "backend_wall_ms",
+        "backend_overhead_ms",
+        "server_ms",
+        "queue_ms",
+        "transport_residual_ms",
+        "client_delivery_residual_ms",
+        "request_bytes",
+        "response_bytes",
+        "pc_cpu_ms",
+        "pc_rss_bytes",
+        "backend_cpu_ms",
+        "backend_rss_bytes",
+        "backend_peak_rss_bytes",
+        "deadline_met",
     )
 
     def __init__(self, directory: Path) -> None:
@@ -356,27 +475,63 @@ class BenchmarkStore:
 
     def summary(self, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         filters = filters or {}
+        filter_keys = {
+            "deployment",
+            "deployment_id",
+            "gesture",
+            "model_version",
+            "experiment_label",
+            "network_profile",
+            "platform",
+            "region",
+            "run_type",
+        }
         records = [
             record
             for record in self.records()
             if all(
                 value in (None, "") or str(record.get(key)) == str(value)
                 for key, value in filters.items()
-                if key in {"deployment", "deployment_id", "gesture", "model_version"}
+                if key in filter_keys
             )
         ]
-        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
         for record in records:
             key = (
                 str(record.get("deployment", record.get("deployment_id", ""))),
                 str(record.get("gesture", "")),
                 str(record.get("model_version", "")),
+                str(record.get("experiment_label", "unspecified")),
+                str(record.get("network_profile", "unspecified")),
+                str(record.get("platform", "unspecified")),
+                str(record.get("region", "unspecified")),
+                record.get("cpu_limit_millicores"),
+                record.get("memory_limit_mib"),
+                int(record.get("concurrency", 1) or 1),
+                str(record.get("run_type", "steady_state")),
+                float(record.get("feedback_deadline_ms", 500.0) or 500.0),
             )
             grouped.setdefault(key, []).append(record)
 
         groups = []
-        for (deployment, gesture, model_version), items in sorted(grouped.items()):
-            correct = sum(bool(item.get("correct")) for item in items)
+        for key, items in sorted(grouped.items(), key=lambda item: str(item[0])):
+            (
+                deployment,
+                gesture,
+                model_version,
+                experiment_label,
+                network_profile,
+                platform,
+                region,
+                cpu_limit_millicores,
+                memory_limit_mib,
+                concurrency,
+                run_type,
+                feedback_deadline_ms,
+            ) = key
+            successful = [item for item in items if _record_outcome(item) == "success"]
+            failures = [item for item in items if _record_outcome(item) != "success"]
+            correct = sum(bool(item.get("correct")) for item in successful)
             metrics = {
                 name: _distribution(items, name)
                 for name in (
@@ -384,17 +539,80 @@ class BenchmarkStore:
                     "inference_ms",
                     "end_to_end_ms",
                     "non_capture_ms",
+                    "post_capture_ms",
+                    "pc_pipeline_ms",
+                    "backend_wall_ms",
+                    "backend_overhead_ms",
+                    "server_ms",
+                    "queue_ms",
+                    "transport_residual_ms",
+                    "client_delivery_residual_ms",
+                    "pc_cpu_ms",
+                    "pc_rss_bytes",
+                    "backend_cpu_ms",
+                    "backend_rss_bytes",
+                    "backend_peak_rss_bytes",
                 )
             }
+            deadline_values = [
+                bool(item["deadline_met"])
+                for item in successful
+                if item.get("deadline_met") is not None
+            ]
+            trusted_values = [
+                bool(item["trusted"])
+                for item in successful
+                if item.get("trusted") is not None
+            ]
+            timeout_count = sum(_record_outcome(item) == "timeout" for item in items)
+            cancelled_count = sum(_record_outcome(item) == "cancelled" for item in items)
+            legacy_failed_attempts = sum(
+                int(item.get("failed_attempts", 0))
+                for item in successful
+                if int(item.get("schema_version", 1) or 1) < 2
+            )
             groups.append(
                 {
                     "deployment": deployment,
                     "gesture": gesture,
                     "model_version": model_version,
-                    "count": len(items),
-                    "accuracy": correct / len(items),
-                    "failed_attempts": sum(
-                        int(item.get("failed_attempts", 0)) for item in items
+                    "experiment_label": experiment_label,
+                    "network_profile": network_profile,
+                    "platform": platform,
+                    "region": region,
+                    "cpu_limit_millicores": cpu_limit_millicores,
+                    "memory_limit_mib": memory_limit_mib,
+                    "concurrency": concurrency,
+                    "run_type": run_type,
+                    "feedback_deadline_ms": feedback_deadline_ms,
+                    "count": len(successful),
+                    "attempt_count": len(items),
+                    "success_count": len(successful),
+                    "failure_count": len(failures),
+                    "timeout_count": timeout_count,
+                    "cancelled_count": cancelled_count,
+                    "retry_count": len(failures) + legacy_failed_attempts,
+                    "success_rate": len(successful) / len(items) if items else 0.0,
+                    "accuracy": correct / len(successful) if successful else 0.0,
+                    "failed_attempts": len(failures) + legacy_failed_attempts,
+                    "deadline_misses": sum(not value for value in deadline_values),
+                    "deadline_miss_rate": (
+                        sum(not value for value in deadline_values) / len(deadline_values)
+                        if deadline_values
+                        else None
+                    ),
+                    "trusted_rate": (
+                        sum(trusted_values) / len(trusted_values)
+                        if trusted_values
+                        else None
+                    ),
+                    "peak_backend_rss_bytes": max(
+                        (
+                            float(item["backend_peak_rss_bytes"])
+                            for item in successful
+                            if item.get("backend_peak_rss_bytes") is not None
+                        ),
+                        default=None,
                     ),
                     **metrics,
                 }
@@ -420,6 +638,27 @@ class BenchmarkStore:
             raise ClientError(f"Benchmark record is missing: {', '.join(missing)}")
         deployment_id = _bounded_int(payload, "deployment_id", 0, 2)
         names = ("local", "edge", "cloud")
+        outcome = str(payload.get("outcome", "success")).strip().lower()
+        if outcome not in {"success", "error", "timeout", "cancelled"}:
+            raise ClientError("outcome must be success, error, timeout, or cancelled.")
+        post_capture_ms = _optional_finite_float(
+            payload.get("post_capture_ms"),
+            "post_capture_ms",
+        )
+        feedback_deadline_ms = _finite_float(
+            payload.get("feedback_deadline_ms", 500.0),
+            "feedback_deadline_ms",
+        )
+        deadline_value = payload.get("deadline_met")
+        deadline_met = (
+            bool(deadline_value)
+            if deadline_value is not None
+            else (
+                post_capture_ms <= feedback_deadline_ms
+                if outcome == "success" and post_capture_ms is not None
+                else None
+            )
+        )
         record = {
             "session_id": str(payload["session_id"]),
             "deployment": str(payload.get("deployment", names[deployment_id])),
@@ -434,22 +673,83 @@ class BenchmarkStore:
             "repetition": _bounded_int(payload, "repetition", 1, 10),
             "attempt": max(1, int(payload.get("attempt", 1))),
             "correct": bool(payload.get("correct", False)),
-            "confidence": _finite_float(payload.get("confidence", 0.0), "confidence"),
+            "confidence": _optional_finite_float(payload.get("confidence"), "confidence"),
             "failed_attempts": max(0, int(payload.get("failed_attempts", 0))),
-            "capture_ms": _finite_float(payload.get("capture_ms", 0.0), "capture_ms"),
-            "inference_ms": _finite_float(payload.get("inference_ms", 0.0), "inference_ms"),
-            "collect_ms": _finite_float(
-                payload.get("collect_ms", payload.get("capture_ms", 0.0)),
+            "capture_ms": _optional_finite_float(payload.get("capture_ms"), "capture_ms"),
+            "inference_ms": _optional_finite_float(payload.get("inference_ms"), "inference_ms"),
+            "collect_ms": _optional_finite_float(
+                payload.get("collect_ms", payload.get("capture_ms")),
                 "collect_ms",
             ),
-            "device_span_ms": _finite_float(
-                payload.get("device_span_ms", 0.0),
+            "device_span_ms": _optional_finite_float(
+                payload.get("device_span_ms"),
                 "device_span_ms",
             ),
-            "end_to_end_ms": _finite_float(payload.get("end_to_end_ms", 0.0), "end_to_end_ms"),
-            "non_capture_ms": _finite_float(payload.get("non_capture_ms", 0.0), "non_capture_ms"),
+            "end_to_end_ms": _optional_finite_float(payload.get("end_to_end_ms"), "end_to_end_ms"),
+            "non_capture_ms": _optional_finite_float(payload.get("non_capture_ms"), "non_capture_ms"),
             "recorded_at": str(payload.get("recorded_at", utc_timestamp())),
+            "schema_version": 2,
+            "outcome": outcome,
+            "error_code": _optional_text(payload.get("error_code"), 128),
+            "predicted": _optional_text(payload.get("predicted"), 128),
+            "trusted": (
+                bool(payload["trusted"]) if payload.get("trusted") is not None else None
+            ),
+            "experiment_label": _profile_text(
+                payload.get("experiment_label", "unspecified"),
+                "experiment_label",
+            ),
+            "network_profile": _profile_text(
+                payload.get("network_profile", "unspecified"),
+                "network_profile",
+            ),
+            "platform": _profile_text(payload.get("platform", "unspecified"), "platform"),
+            "region": _profile_text(payload.get("region", "unspecified"), "region"),
+            "cpu_limit_millicores": _optional_profile_int(
+                payload.get("cpu_limit_millicores"),
+                "cpu_limit_millicores",
+            ),
+            "memory_limit_mib": _optional_profile_int(
+                payload.get("memory_limit_mib"),
+                "memory_limit_mib",
+            ),
+            "concurrency": _profile_int(payload.get("concurrency", 1), "concurrency", 1, 1000),
+            "run_type": _profile_text(payload.get("run_type", "steady_state"), "run_type"),
+            "feedback_deadline_ms": feedback_deadline_ms,
+            "post_capture_ms": post_capture_ms,
+            "pc_pipeline_ms": _optional_finite_float(payload.get("pc_pipeline_ms"), "pc_pipeline_ms"),
+            "backend_wall_ms": _optional_finite_float(payload.get("backend_wall_ms"), "backend_wall_ms"),
+            "backend_overhead_ms": _optional_finite_float(
+                payload.get("backend_overhead_ms"),
+                "backend_overhead_ms",
+            ),
+            "server_ms": _optional_finite_float(payload.get("server_ms"), "server_ms"),
+            "queue_ms": _optional_finite_float(payload.get("queue_ms"), "queue_ms"),
+            "transport_residual_ms": _optional_finite_float(
+                payload.get("transport_residual_ms"),
+                "transport_residual_ms",
+            ),
+            "client_delivery_residual_ms": _optional_finite_float(
+                payload.get("client_delivery_residual_ms"),
+                "client_delivery_residual_ms",
+            ),
+            "request_bytes": _optional_nonnegative_int(payload.get("request_bytes"), "request_bytes"),
+            "response_bytes": _optional_nonnegative_int(payload.get("response_bytes"), "response_bytes"),
+            "pc_cpu_ms": _optional_finite_float(payload.get("pc_cpu_ms"), "pc_cpu_ms"),
+            "pc_rss_bytes": _optional_nonnegative_int(payload.get("pc_rss_bytes"), "pc_rss_bytes"),
+            "backend_cpu_ms": _optional_finite_float(payload.get("backend_cpu_ms"), "backend_cpu_ms"),
+            "backend_rss_bytes": _optional_nonnegative_int(
+                payload.get("backend_rss_bytes"),
+                "backend_rss_bytes",
+            ),
+            "backend_peak_rss_bytes": _optional_nonnegative_int(
+                payload.get("backend_peak_rss_bytes"),
+                "backend_peak_rss_bytes",
+            ),
+            "deadline_met": deadline_met,
         }
+        if record["run_type"] not in {"steady_state", "cold_start"}:
+            raise ClientError("run_type must be steady_state or cold_start.")
         return record
 
 
@@ -493,10 +793,34 @@ class LoggingService:
         return self.benchmarks.csv_text()
 
 
-def _distribution(records: list[dict[str, Any]], field_name: str) -> dict[str, float]:
-    values = sorted(float(record.get(field_name, 0.0)) for record in records)
-    index = max(0, math.ceil(0.95 * len(values)) - 1)
-    return {"p50": statistics.median(values), "p95": values[index]}
+def _record_outcome(record: dict[str, Any]) -> str:
+    return str(record.get("outcome", "success") or "success")
+
+
+def _distribution(
+    records: list[dict[str, Any]],
+    field_name: str,
+) -> dict[str, float | int | None]:
+    values = sorted(
+        float(record[field_name])
+        for record in records
+        if _record_outcome(record) == "success"
+        and record.get(field_name) is not None
+        and math.isfinite(float(record[field_name]))
+    )
+    if not values:
+        return {"count": 0, "p50": None, "p95": None, "p99": None}
+
+    def percentile(fraction: float) -> float:
+        index = max(0, math.ceil(fraction * len(values)) - 1)
+        return values[index]
+
+    return {
+        "count": len(values),
+        "p50": statistics.median(values),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+    }
 
 
 class ApiHub:
@@ -505,6 +829,7 @@ class ApiHub:
         source_factories: dict[str, type[InferenceSource]] | None = None,
     ) -> None:
         self.config = SourceConfig()
+        self.experiment_profile = ExperimentProfile()
         self.stats = ClientStats()
         self.connected = False
         self.session_running = False
@@ -523,7 +848,7 @@ class ApiHub:
         self._connect_lock = asyncio.Lock()
         self._completed_captures: dict[int, tuple[bytes, dict[str, Any]]] = {}
         self._capture_tasks: dict[int, asyncio.Task[dict[str, Any]]] = {}
-        self._capture_errors: dict[int, str] = {}
+        self._capture_errors: dict[int, dict[str, str]] = {}
 
     def configure(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.connected:
@@ -545,6 +870,10 @@ class ApiHub:
             )
         self.config = next_config
         return self.state_snapshot()
+
+    def configure_experiment_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.experiment_profile = ExperimentProfile.from_payload(payload)
+        return self.experiment_profile.to_dict()
 
     async def connect(self) -> dict[str, Any]:
         # BLE discovery and runner warm-up can take several seconds. Serialize
@@ -626,7 +955,10 @@ class ApiHub:
         capture_tasks = list(self._capture_tasks.items())
         self._capture_tasks.clear()
         for window_id, capture_task in capture_tasks:
-            self._capture_errors[window_id] = "Capture stopped because the source disconnected."
+            self._capture_errors[window_id] = {
+                "message": "Capture stopped because the source disconnected.",
+                "error_code": "cancelled",
+            }
             capture_task.cancel()
         if capture_tasks:
             await asyncio.gather(
@@ -704,12 +1036,15 @@ class ApiHub:
             raise ClientError(f"Gesture not found in current menu: {requested}")
 
         async with self._capture_lock:
+            pipeline_started_ns = time.perf_counter_ns()
+            pc_before = _current_process_point()
             try:
                 if capture_samples is not None:
                     model_backend = self._model_backend
                     if model_backend is None:
                         raise ModelBackendError("No model backend is connected.")
                     captured = await capture_samples()
+                    post_capture_started_ns = time.perf_counter_ns()
                     inference = await model_backend.classify(
                         window_id,
                         captured.features(),
@@ -722,6 +1057,24 @@ class ApiHub:
                     predicted = MODEL_LABELS[predicted_class]
                     trusted = confidence >= CONFIDENCE_THRESHOLD
                     correct = predicted.casefold() == choice.label.casefold()
+                    backend_wall_us = getattr(
+                        inference,
+                        "backend_wall_us",
+                        inference.inference_us,
+                    )
+                    server_us = getattr(inference, "server_us", None)
+                    queue_us = getattr(inference, "queue_us", None)
+                    transport_residual_us = getattr(
+                        inference,
+                        "transport_residual_us",
+                        None,
+                    )
+                    profile_payload = payload.get("experiment_profile")
+                    profile = (
+                        ExperimentProfile.from_payload(profile_payload)
+                        if isinstance(profile_payload, dict)
+                        else self.experiment_profile
+                    )
                     packet = pack_result_packet(
                         deployment=model_backend.deployment_id,
                         window_id=window_id,
@@ -759,10 +1112,64 @@ class ApiHub:
                         "collect_ms": captured.capture_ms,
                         "device_span_ms": captured.device_span_ms,
                         "inference_ms": inference.inference_us / 1000.0,
-                        "timing_ms": {"wall": inference.inference_us / 1000.0},
+                        "backend_wall_ms": _microseconds_to_milliseconds(
+                            backend_wall_us
+                        ),
+                        "backend_overhead_ms": _microseconds_to_milliseconds(
+                            getattr(inference, "backend_overhead_us", None)
+                        ),
+                        "server_ms": _microseconds_to_milliseconds(server_us),
+                        "queue_ms": _microseconds_to_milliseconds(queue_us),
+                        "transport_residual_ms": _microseconds_to_milliseconds(
+                            transport_residual_us
+                        ),
+                        "request_bytes": getattr(inference, "request_bytes", None),
+                        "response_bytes": getattr(inference, "response_bytes", None),
+                        "backend_cpu_ms": _microseconds_to_milliseconds(
+                            getattr(inference, "backend_cpu_us", None)
+                        ),
+                        "backend_rss_bytes": getattr(inference, "backend_rss_bytes", None),
+                        "backend_peak_rss_bytes": getattr(
+                            inference,
+                            "backend_peak_rss_bytes",
+                            None,
+                        ),
+                        "timing_ms": {
+                            "wall": _microseconds_to_milliseconds(
+                                backend_wall_us
+                            ),
+                            "server": _microseconds_to_milliseconds(server_us),
+                            "queue": _microseconds_to_milliseconds(queue_us),
+                            "inference": inference.inference_us / 1000.0,
+                            "transport_residual": _microseconds_to_milliseconds(
+                                transport_residual_us
+                            ),
+                        },
+                        "experiment_profile": profile.to_dict(),
                         "scores": dict(zip(MODEL_LABELS, inference.scores)),
                         "error": None,
                     }
+                    result_ready_ns = time.perf_counter_ns()
+                    post_capture_ms = (
+                        result_ready_ns - post_capture_started_ns
+                    ) / 1_000_000.0
+                    pc_pipeline_ms = (
+                        result_ready_ns - pipeline_started_ns
+                    ) / 1_000_000.0
+                    pc_after = _current_process_point()
+                    detail.update(
+                        {
+                            "post_capture_ms": post_capture_ms,
+                            "pc_pipeline_ms": pc_pipeline_ms,
+                            "pc_cpu_ms": _process_cpu_delta_ms(pc_before, pc_after),
+                            "pc_rss_bytes": (
+                                pc_after.rss_bytes if pc_after is not None else None
+                            ),
+                            "deadline_met": (
+                                post_capture_ms <= profile.feedback_deadline_ms
+                            ),
+                        }
+                    )
                 else:
                     packet, detail = await capture_window(
                         window_id=window_id,
@@ -772,18 +1179,20 @@ class ApiHub:
                     )
             except (ImuSourceError, ModelBackendError) as error:
                 self.last_error = str(error)
+                error_code = _capture_error_code(error)
                 await self._broadcast(
                     {
                         "type": "error",
                         "received_at": utc_timestamp(),
                         "data": {
                             "message": str(error),
+                            "error_code": error_code,
                             "window_id": window_id,
                             "repetition": repetition,
                         },
                     }
                 )
-                raise ClientError(str(error)) from error
+                raise ClientError(str(error), error_code=error_code) from error
 
         received_at = utc_timestamp()
         self.stats.valid_count += 1
@@ -850,9 +1259,15 @@ class ApiHub:
         try:
             task.result()
         except asyncio.CancelledError:
-            self._capture_errors.setdefault(window_id, "Capture was cancelled.")
+            self._capture_errors.setdefault(
+                window_id,
+                {"message": "Capture was cancelled.", "error_code": "cancelled"},
+            )
         except Exception as error:
-            self._capture_errors[window_id] = str(error)
+            self._capture_errors[window_id] = {
+                "message": str(error),
+                "error_code": str(getattr(error, "error_code", "client_error")),
+            }
 
     def capture_status(self, window_id: int) -> dict[str, Any]:
         completed = self._completed_captures.get(window_id)
@@ -866,7 +1281,7 @@ class ApiHub:
             }
         error = self._capture_errors.get(window_id)
         if error is not None:
-            return {"status": "error", "window_id": window_id, "message": error}
+            return {"status": "error", "window_id": window_id, **error}
         task = self._capture_tasks.get(window_id)
         if task is not None and not task.done():
             return {"status": "pending", "window_id": window_id}
@@ -946,6 +1361,7 @@ class ApiHub:
         log_file = self._logging.active_path if self._logging is not None else None
         return {
             "config": self.config.to_dict(),
+            "experiment_profile": self.experiment_profile.to_dict(),
             "connected": self.connected,
             "session_running": self.session_running,
             "gesture_menu": self.gesture_menu,
@@ -1190,6 +1606,22 @@ def sanitize_web_data(device_event: dict[str, Any]) -> dict[str, Any]:
         "inference_ms",
         "collect_ms",
         "device_span_ms",
+        "post_capture_ms",
+        "pc_pipeline_ms",
+        "backend_wall_ms",
+        "backend_overhead_ms",
+        "server_ms",
+        "queue_ms",
+        "transport_residual_ms",
+        "request_bytes",
+        "response_bytes",
+        "pc_cpu_ms",
+        "pc_rss_bytes",
+        "backend_cpu_ms",
+        "backend_rss_bytes",
+        "backend_peak_rss_bytes",
+        "deadline_met",
+        "experiment_profile",
         "timing_ms",
         "memory_bytes",
         "scores",
@@ -1258,6 +1690,89 @@ def _finite_float(value: Any, field_name: str) -> float:
     if not math.isfinite(number) or number < 0:
         raise ClientError(f"{field_name} must be a finite non-negative number.")
     return number
+
+
+def _optional_finite_float(value: Any, field_name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    return _finite_float(value, field_name)
+
+
+def _optional_nonnegative_int(value: Any, field_name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ClientError(f"{field_name} must be an integer.") from None
+    if number < 0:
+        raise ClientError(f"{field_name} must be non-negative.")
+    return number
+
+
+def _optional_text(value: Any, maximum_length: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > maximum_length:
+        raise ClientError(f"Text values must not exceed {maximum_length} characters.")
+    return text
+
+
+def _profile_text(value: Any, field_name: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    text = text or "unspecified"
+    if len(text) > 128:
+        raise ClientError(f"{field_name} must not exceed 128 characters.")
+    return text
+
+
+def _profile_int(
+    value: Any,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ClientError(f"{field_name} must be an integer.") from None
+    if number < minimum or number > maximum:
+        raise ClientError(f"{field_name} must be between {minimum} and {maximum}.")
+    return number
+
+
+def _optional_profile_int(value: Any, field_name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    return _profile_int(value, field_name, 1, 2_147_483_647)
+
+
+def _microseconds_to_milliseconds(value: int | None) -> float | None:
+    return value / 1000.0 if value is not None else None
+
+
+def _process_cpu_delta_ms(
+    before: _ProcessPoint | None,
+    after: _ProcessPoint | None,
+) -> float | None:
+    if before is None or after is None:
+        return None
+    return max(0.0, (after.cpu_seconds - before.cpu_seconds) * 1000.0)
+
+
+def _capture_error_code(error: Exception) -> str:
+    if isinstance(error, SequenceGapError):
+        return "sequence_gap"
+    if isinstance(error, SamplingContractError):
+        return "sampling_contract"
+    if isinstance(error, ModelBackendError):
+        return str(getattr(error, "error_code", "model_error"))
+    if isinstance(error, ImuSourceError):
+        return "source_error"
+    return "client_error"
 
 
 def _bounded_float(
@@ -1336,6 +1851,19 @@ def create_app(hub: ApiHub | None = None) -> Any:
     @app.get("/api/state")
     async def state() -> dict[str, Any]:
         return api_hub.state_snapshot()
+
+    @app.get("/api/experiment-profile")
+    async def experiment_profile() -> dict[str, Any]:
+        return api_hub.experiment_profile.to_dict()
+
+    @app.put("/api/experiment-profile")
+    async def configure_experiment_profile(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        try:
+            return api_hub.configure_experiment_profile(payload)
+        except ClientError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/events")
     async def events(after_id: int = 0, limit: int = 100) -> dict[str, Any]:
@@ -1435,12 +1963,22 @@ def create_app(hub: ApiHub | None = None) -> Any:
         deployment: str | None = None,
         gesture: str | None = None,
         model_version: str | None = None,
+        experiment_label: str | None = None,
+        network_profile: str | None = None,
+        platform: str | None = None,
+        region: str | None = None,
+        run_type: str | None = None,
     ) -> dict[str, Any]:
         return api_hub.benchmark_summary(
             {
                 "deployment": deployment,
                 "gesture": gesture,
                 "model_version": model_version,
+                "experiment_label": experiment_label,
+                "network_profile": network_profile,
+                "platform": platform,
+                "region": region,
+                "run_type": run_type,
             }
         )
 
@@ -1481,6 +2019,12 @@ def web_gui_html() -> str:
     .metric { display: grid; gap: 4px; padding: 10px; background: #eef3f4; border-radius: 6px; }
     .metric span:first-child { color: #52636f; font-size: 12px; text-transform: uppercase; }
     .metric span:last-child { overflow-wrap: anywhere; }
+    .summary-cards { margin: 12px 0; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px; border-bottom: 1px solid #d8dee4; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+    details { margin-top: 12px; }
     pre { white-space: pre-wrap; max-height: 260px; overflow: auto; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 6px; }
   </style>
 </head>
@@ -1546,6 +2090,42 @@ def web_gui_html() -> str:
       </div>
     </section>
     <section>
+      <h2>Experiment Profile</h2>
+      <div class="grid">
+        <label>Experiment label
+          <input id="experimentLabel" value="unspecified">
+        </label>
+        <label>Network profile
+          <input id="networkProfile" value="unspecified" placeholder="campus Wi-Fi, Ethernet, 5G">
+        </label>
+        <label>Platform
+          <input id="experimentPlatform" value="unspecified" placeholder="Rahti, cPouta, local PC">
+        </label>
+        <label>Region / cluster
+          <input id="experimentRegion" value="unspecified">
+        </label>
+        <label>CPU limit (millicores, optional)
+          <input id="experimentCpu" type="number" min="1">
+        </label>
+        <label>Memory limit (MiB, optional)
+          <input id="experimentMemory" type="number" min="1">
+        </label>
+        <label>Concurrency
+          <input id="experimentConcurrency" type="number" min="1" max="1000" value="1">
+        </label>
+        <label>Run type
+          <select id="experimentRunType">
+            <option value="steady_state">Steady state</option>
+            <option value="cold_start">Cold start</option>
+          </select>
+        </label>
+        <label>Post-capture deadline (ms)
+          <input id="experimentDeadline" type="number" min="1" max="120000" value="500">
+        </label>
+      </div>
+      <button onclick="saveExperimentProfile()">Save Experiment Profile</button>
+    </section>
+    <section>
       <h2>Live Status</h2>
       <div class="grid">
         <div class="metric"><span>Connected</span><span id="connected">-</span></div>
@@ -1569,12 +2149,29 @@ def web_gui_html() -> str:
         <label>Model version filter
           <input id="benchmarkModel" placeholder="19">
         </label>
+        <label>Experiment filter
+          <input id="benchmarkExperiment" placeholder="experiment label">
+        </label>
+        <label>Network filter
+          <input id="benchmarkNetwork" placeholder="network profile">
+        </label>
       </div>
       <div class="row">
         <button class="secondary" onclick="refreshBenchmarks()">Refresh Summary</button>
         <button onclick="location.href='/api/benchmarks/export.csv'">Export CSV</button>
       </div>
-      <pre id="benchmarks"></pre>
+      <div id="benchmarkCards" class="grid summary-cards"></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Deployment</th><th>Context</th><th>Attempts</th><th>Success</th>
+            <th>Accuracy</th><th>Deadline misses</th><th>Post p50</th>
+            <th>Post p95</th><th>Post p99</th><th>Transport p95</th><th>Peak RSS</th>
+          </tr></thead>
+          <tbody id="benchmarkRows"></tbody>
+        </table>
+      </div>
+      <details><summary>Raw summary JSON</summary><pre id="benchmarks"></pre></details>
     </section>
     <section>
       <h2>Event Stream</h2>
@@ -1591,6 +2188,13 @@ def web_gui_html() -> str:
     ];
     const dirtyConfigFields = new Set();
     let configEditRevision = 0;
+    const experimentFieldIds = [
+      'experimentLabel', 'networkProfile', 'experimentPlatform',
+      'experimentRegion', 'experimentCpu', 'experimentMemory',
+      'experimentConcurrency', 'experimentRunType', 'experimentDeadline'
+    ];
+    const dirtyExperimentFields = new Set();
+    let experimentEditRevision = 0;
 
     function markConfigDirty(id) {
       dirtyConfigFields.add(id);
@@ -1599,6 +2203,12 @@ def web_gui_html() -> str:
 
     for (const id of configFieldIds) {
       $(id).addEventListener('input', () => markConfigDirty(id));
+    }
+    for (const id of experimentFieldIds) {
+      $(id).addEventListener('input', () => {
+        dirtyExperimentFields.add(id);
+        experimentEditRevision += 1;
+      });
     }
 
     function renderConfigValue(id, value) {
@@ -1609,6 +2219,23 @@ def web_gui_html() -> str:
     function renderConfigChecked(id, checked) {
       if (dirtyConfigFields.has(id)) return;
       $(id).checked = checked;
+    }
+
+    function renderExperimentValue(id, value) {
+      if (dirtyExperimentFields.has(id)) return;
+      $(id).value = value ?? '';
+    }
+
+    function renderExperimentProfile(profile = {}) {
+      renderExperimentValue('experimentLabel', profile.experiment_label || 'unspecified');
+      renderExperimentValue('networkProfile', profile.network_profile || 'unspecified');
+      renderExperimentValue('experimentPlatform', profile.platform || 'unspecified');
+      renderExperimentValue('experimentRegion', profile.region || 'unspecified');
+      renderExperimentValue('experimentCpu', profile.cpu_limit_millicores);
+      renderExperimentValue('experimentMemory', profile.memory_limit_mib);
+      renderExperimentValue('experimentConcurrency', profile.concurrency || 1);
+      renderExperimentValue('experimentRunType', profile.run_type || 'steady_state');
+      renderExperimentValue('experimentDeadline', profile.feedback_deadline_ms || 500);
     }
 
     async function api(path, options = {}) {
@@ -1660,6 +2287,27 @@ def web_gui_html() -> str:
         dirtyConfigFields.clear();
       }
       renderState(state);
+    }
+
+    async function saveExperimentProfile() {
+      const submittedRevision = experimentEditRevision;
+      const profile = await api('/api/experiment-profile', {
+        method: 'PUT',
+        body: JSON.stringify({
+          experiment_label: $('experimentLabel').value,
+          network_profile: $('networkProfile').value,
+          platform: $('experimentPlatform').value,
+          region: $('experimentRegion').value,
+          cpu_limit_millicores: $('experimentCpu').value || null,
+          memory_limit_mib: $('experimentMemory').value || null,
+          concurrency: Number($('experimentConcurrency').value),
+          run_type: $('experimentRunType').value,
+          feedback_deadline_ms: Number($('experimentDeadline').value)
+        })
+      });
+      if (experimentEditRevision === submittedRevision) dirtyExperimentFields.clear();
+      renderExperimentProfile(profile);
+      await refreshBenchmarks();
     }
 
     async function connectSource() {
@@ -1750,15 +2398,73 @@ def web_gui_html() -> str:
       if ($('benchmarkDeployment').value) query.set('deployment', $('benchmarkDeployment').value);
       if ($('benchmarkGesture').value) query.set('gesture', $('benchmarkGesture').value);
       if ($('benchmarkModel').value) query.set('model_version', $('benchmarkModel').value);
-      $('benchmarks').textContent = JSON.stringify(
-        await api(`/api/benchmarks/summary?${query}`), null, 2
+      if ($('benchmarkExperiment').value) query.set('experiment_label', $('benchmarkExperiment').value);
+      if ($('benchmarkNetwork').value) query.set('network_profile', $('benchmarkNetwork').value);
+      const summary = await api(`/api/benchmarks/summary?${query}`);
+      renderBenchmarkSummary(summary);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      })[character]);
+    }
+
+    function percent(value) {
+      return value == null ? '-' : `${(Number(value) * 100).toFixed(1)}%`;
+    }
+
+    function p95(group, name) {
+      const value = group[name]?.p95;
+      return value == null ? '-' : `${Number(value).toFixed(2)} ms`;
+    }
+
+    function bytes(value) {
+      if (value == null) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB'];
+      let number = Number(value), unit = 0;
+      while (number >= 1024 && unit < units.length - 1) { number /= 1024; unit += 1; }
+      return `${number.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+    }
+
+    function renderBenchmarkSummary(summary) {
+      const groups = summary.groups || [];
+      const attempts = groups.reduce((sum, group) => sum + Number(group.attempt_count || 0), 0);
+      const successes = groups.reduce((sum, group) => sum + Number(group.success_count || 0), 0);
+      const misses = groups.reduce((sum, group) => sum + Number(group.deadline_misses || 0), 0);
+      const correct = groups.reduce(
+        (sum, group) => sum + Number(group.accuracy || 0) * Number(group.success_count || 0), 0
       );
+      const cards = [
+        ['Attempts', attempts],
+        ['Success rate', attempts ? percent(successes / attempts) : '-'],
+        ['Accuracy', successes ? percent(correct / successes) : '-'],
+        ['Deadline misses', misses]
+      ];
+      $('benchmarkCards').innerHTML = cards.map(
+        ([label, value]) => `<div class="metric"><span>${label}</span><span>${value}</span></div>`
+      ).join('');
+      $('benchmarkRows').innerHTML = groups.map((group) => {
+        const context = [group.experiment_label, group.network_profile, group.run_type]
+          .filter(Boolean).join(' / ');
+        return `<tr>
+          <td>${escapeHtml(group.deployment)}</td><td>${escapeHtml(context)}</td>
+          <td>${group.attempt_count}</td><td>${percent(group.success_rate)}</td>
+          <td>${percent(group.accuracy)}</td><td>${group.deadline_misses ?? '-'}</td>
+          <td>${group.post_capture_ms?.p50 == null ? '-' : Number(group.post_capture_ms.p50).toFixed(2) + ' ms'}</td>
+          <td>${p95(group, 'post_capture_ms')}</td>
+          <td>${group.post_capture_ms?.p99 == null ? '-' : Number(group.post_capture_ms.p99).toFixed(2) + ' ms'}</td>
+          <td>${p95(group, 'transport_residual_ms')}</td><td>${bytes(group.peak_backend_rss_bytes)}</td>
+        </tr>`;
+      }).join('');
+      $('benchmarks').textContent = JSON.stringify(summary, null, 2);
     }
 
     function renderState(state) {
       $('connected').textContent = state.connected ? 'yes' : 'no';
       $('source').textContent = state.config?.source_type || '-';
       $('activeModel').textContent = state.config?.model_backend || '-';
+      renderExperimentProfile(state.experiment_profile || {});
       renderConfigValue(
         'sourceType',
         state.config?.source_type || $('sourceType').value
@@ -1911,6 +2617,11 @@ def mobile_session_html() -> str:
     let completed = 0;
     let failed = 0;
     let resultLines = [];
+    let profileSnapshot = {};
+    let deploymentSnapshot = 'local';
+    let modelVersionSnapshot = 'unknown';
+    let pendingBenchmarkRecords = [];
+    let benchmarkFlushTimer = null;
 
     function nextWindowId() {
       windowCounter = (windowCounter + 1) % 4294967296;
@@ -1986,6 +2697,7 @@ def mobile_session_html() -> str:
           if (response.status === 409 || data.status === 'error') {
             const failure = new Error(data.message || 'Capture failed.');
             failure.captureFailure = true;
+            failure.errorCode = data.error_code || 'client_error';
             throw failure;
           }
           if (response.status === 404) await queueCapture(payload);
@@ -2000,33 +2712,111 @@ def mobile_session_html() -> str:
 
     function showResult(repetition, detail, endToEndMs) {
       const confidence = Number(detail.confidence || 0) * 100;
+      const postCaptureMs = Number(detail.post_capture_ms || 0);
       resultLines.unshift(
         `${repetition}. ${detail.predicted || detail.label || 'Unknown'} | ` +
         `${confidence.toFixed(1)}% | ${detail.correct ? 'correct' : 'incorrect'} | ` +
-        `${endToEndMs.toFixed(1)} ms end-to-end`
+        `${postCaptureMs.toFixed(1)} ms post-capture | ${endToEndMs.toFixed(1)} ms end-to-end`
       );
       $('results').textContent = resultLines.join('\\n');
     }
 
-    async function saveBenchmark({sessionId, gesture, windowId, repetition, attempt, detail, endToEndMs}) {
-      const captureMs = Number(detail.collect_ms || 0);
-      const inferenceMs = Number(detail.inference_ms || 0);
-      const deployment = detail.deployment || 'local';
+    function numberOrNull(value) {
+      if (value == null || value === '') return null;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function profileFields() {
+      return {
+        experiment_label: profileSnapshot.experiment_label || 'unspecified',
+        network_profile: profileSnapshot.network_profile || 'unspecified',
+        platform: profileSnapshot.platform || 'unspecified',
+        region: profileSnapshot.region || 'unspecified',
+        cpu_limit_millicores: profileSnapshot.cpu_limit_millicores ?? null,
+        memory_limit_mib: profileSnapshot.memory_limit_mib ?? null,
+        concurrency: Number(profileSnapshot.concurrency || 1),
+        run_type: profileSnapshot.run_type || 'steady_state',
+        feedback_deadline_ms: Number(profileSnapshot.feedback_deadline_ms || 500)
+      };
+    }
+
+    function queueBenchmarkRecord(record) {
+      pendingBenchmarkRecords.push(record);
+      scheduleBenchmarkFlush(0);
+    }
+
+    function scheduleBenchmarkFlush(delayMs) {
+      if (benchmarkFlushTimer != null) return;
+      benchmarkFlushTimer = setTimeout(() => {
+        benchmarkFlushTimer = null;
+        flushBenchmarkQueue();
+      }, delayMs);
+    }
+
+    async function flushBenchmarkQueue() {
+      if (!pendingBenchmarkRecords.length) return;
+      try {
+        await api('/api/benchmarks/records', {
+          method: 'POST', body: JSON.stringify(pendingBenchmarkRecords[0])
+        }, 3000);
+        pendingBenchmarkRecords.shift();
+        if (pendingBenchmarkRecords.length) scheduleBenchmarkFlush(0);
+      } catch (_) {
+        scheduleBenchmarkFlush(1000);
+      }
+    }
+
+    function saveSuccessfulBenchmark({sessionId, gesture, windowId, repetition, attempt, detail, endToEndMs}) {
+      const captureMs = numberOrNull(detail.collect_ms);
+      const inferenceMs = numberOrNull(detail.inference_ms);
+      const pcPipelineMs = numberOrNull(detail.pc_pipeline_ms);
+      const postCaptureMs = numberOrNull(detail.post_capture_ms);
+      const deployment = detail.deployment || deploymentSnapshot;
       const deploymentId = {local: 0, edge: 1, cloud: 2}[deployment] ?? 0;
-      await api('/api/benchmarks/records', {
-        method: 'POST',
-        body: JSON.stringify({
-          type: 'benchmark_record', session_id: sessionId,
-          deployment, deployment_id: deploymentId, gesture,
-          model_version: detail.model_version || 'unknown', window_id: windowId, repetition, attempt,
-          source_sequence: Number(detail.source_sequence || 0),
-          correct: Boolean(detail.correct), confidence: Number(detail.confidence || 0),
-          failed_attempts: failed, capture_ms: captureMs,
-          collect_ms: captureMs, device_span_ms: Number(detail.device_span_ms || 0),
-          inference_ms: inferenceMs, end_to_end_ms: endToEndMs,
-          non_capture_ms: Math.max(0, endToEndMs - captureMs - inferenceMs)
-        })
-      }, 3000);
+      queueBenchmarkRecord({
+        type: 'benchmark_record', schema_version: 2, outcome: 'success',
+        session_id: sessionId, deployment, deployment_id: deploymentId, gesture,
+        model_version: detail.model_version || modelVersionSnapshot,
+        window_id: windowId, repetition, attempt,
+        source_sequence: Number(detail.source_sequence || 0),
+        predicted: detail.predicted || detail.label || null,
+        correct: Boolean(detail.correct), trusted: Boolean(detail.trusted),
+        confidence: numberOrNull(detail.confidence), failed_attempts: failed,
+        capture_ms: captureMs, collect_ms: captureMs,
+        device_span_ms: numberOrNull(detail.device_span_ms), inference_ms: inferenceMs,
+        end_to_end_ms: endToEndMs,
+        non_capture_ms: Math.max(0, endToEndMs - (captureMs || 0) - (inferenceMs || 0)),
+        post_capture_ms: postCaptureMs, pc_pipeline_ms: pcPipelineMs,
+        backend_wall_ms: numberOrNull(detail.backend_wall_ms),
+        backend_overhead_ms: numberOrNull(detail.backend_overhead_ms),
+        server_ms: numberOrNull(detail.server_ms), queue_ms: numberOrNull(detail.queue_ms),
+        transport_residual_ms: numberOrNull(detail.transport_residual_ms),
+        client_delivery_residual_ms: pcPipelineMs == null ? null : Math.max(0, endToEndMs - pcPipelineMs),
+        request_bytes: numberOrNull(detail.request_bytes),
+        response_bytes: numberOrNull(detail.response_bytes),
+        pc_cpu_ms: numberOrNull(detail.pc_cpu_ms), pc_rss_bytes: numberOrNull(detail.pc_rss_bytes),
+        backend_cpu_ms: numberOrNull(detail.backend_cpu_ms),
+        backend_rss_bytes: numberOrNull(detail.backend_rss_bytes),
+        backend_peak_rss_bytes: numberOrNull(detail.backend_peak_rss_bytes),
+        deadline_met: postCaptureMs == null ? null : postCaptureMs <= Number(profileSnapshot.feedback_deadline_ms || 500),
+        ...profileFields()
+      });
+    }
+
+    function saveFailedBenchmark({sessionId, gesture, windowId, repetition, attempt, error, endToEndMs}) {
+      const outcome = error?.errorCode === 'model_timeout' ||
+        /timed out|no result|after 15 seconds/i.test(error?.message || '') ? 'timeout' :
+        (stopRequested ? 'cancelled' : 'error');
+      const deploymentId = {local: 0, edge: 1, cloud: 2}[deploymentSnapshot] ?? 0;
+      queueBenchmarkRecord({
+        type: 'benchmark_record', schema_version: 2, outcome,
+        error_code: error?.errorCode || (outcome === 'timeout' ? 'client_poll_timeout' : 'client_error'),
+        session_id: sessionId, deployment: deploymentSnapshot,
+        deployment_id: deploymentId, gesture, model_version: modelVersionSnapshot,
+        window_id: windowId, repetition, attempt, failed_attempts: failed,
+        end_to_end_ms: endToEndMs, ...profileFields()
+      });
     }
 
     function askRetry(message) {
@@ -2042,15 +2832,17 @@ def mobile_session_html() -> str:
       $('startButton').disabled = false;
       $('stopButton').hidden = true;
       $('retryButton').hidden = true;
+      scheduleBenchmarkFlush(0);
       if (completed === 10) setPhase('Complete', message);
       else if (stopRequested) setPhase('Stopped', message);
     }
 
     async function startRun() {
       if (running) return;
+      let startingState;
       try {
-        const state = await api('/api/state');
-        if (!state.connected || state.config?.source_type !== 'xiao_ble_imu') {
+        startingState = await api('/api/state');
+        if (!startingState.connected || startingState.config?.source_type !== 'xiao_ble_imu') {
           throw new Error('Connect the XIAO raw BLE IMU source from the PC setup page first.');
         }
       } catch (error) {
@@ -2063,6 +2855,9 @@ def mobile_session_html() -> str:
       completed = 0;
       failed = 0;
       resultLines = [];
+      profileSnapshot = Object.freeze({...startingState.experiment_profile});
+      deploymentSnapshot = startingState.config?.model_backend || 'local';
+      modelVersionSnapshot = startingState.config?.model_version || 'unknown';
       $('results').textContent = 'Waiting for first result.';
       $('motion').disabled = true;
       $('startButton').disabled = true;
@@ -2077,6 +2872,8 @@ def mobile_session_html() -> str:
       while (!stopRequested && completed < 10) {
         const repetition = completed + 1;
         attempt += 1;
+        let windowId = null;
+        let greenStarted = null;
         try {
           setPhase('Get ready', `${gesture} - repetition ${repetition} of 10`);
           await delay(1000);
@@ -2086,13 +2883,13 @@ def mobile_session_html() -> str:
           }
           if (stopRequested) break;
 
-          const windowId = nextWindowId();
+          windowId = nextWindowId();
           const payload = {
             type: 'capture', window_id: windowId, selection,
-            repetition, gesture
+            repetition, gesture, experiment_profile: profileSnapshot
           };
           setPhase('GO', `Perform ${gesture} now`, 'green');
-          const greenStarted = performance.now();
+          greenStarted = performance.now();
           await queueCapture(payload);
           const snapshot = await pollCapture(payload);
           const resultAt = performance.now();
@@ -2102,9 +2899,9 @@ def mobile_session_html() -> str:
           completed += 1;
           showResult(repetition, detail, endToEndMs);
           updateProgress();
-          saveBenchmark({
+          saveSuccessfulBenchmark({
             sessionId, gesture, windowId, repetition, attempt, detail, endToEndMs
-          }).catch(() => {});
+          });
           attempt = 0;
 
           if (completed < 10) {
@@ -2112,8 +2909,22 @@ def mobile_session_html() -> str:
             await delay(2000);
           }
         } catch (error) {
-          if (stopRequested) break;
+          if (stopRequested) {
+            if (windowId != null && greenStarted != null) {
+              saveFailedBenchmark({
+                sessionId, gesture, windowId, repetition, attempt, error,
+                endToEndMs: performance.now() - greenStarted
+              });
+            }
+            break;
+          }
           failed += 1;
+          if (windowId != null && greenStarted != null) {
+            saveFailedBenchmark({
+              sessionId, gesture, windowId, repetition, attempt, error,
+              endToEndMs: performance.now() - greenStarted
+            });
+          }
           updateProgress();
           const retry = await askRetry(error.message || String(error));
           $('retryButton').hidden = true;

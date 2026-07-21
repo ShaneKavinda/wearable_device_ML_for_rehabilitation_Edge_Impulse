@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
+import psutil
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -118,10 +119,17 @@ class InferenceRequest(BaseModel):
 
 
 class _Gauge:
-    def __init__(self, name: str, help_text: str, initial: float = 0.0) -> None:
+    def __init__(
+        self,
+        name: str,
+        help_text: str,
+        initial: float = 0.0,
+        metric_type: str = "gauge",
+    ) -> None:
         self.name = name
         self.help_text = help_text
         self.value = initial
+        self.metric_type = metric_type
 
     def set(self, value: float) -> None:
         self.value = float(value)
@@ -135,9 +143,49 @@ class _Gauge:
     def render(self) -> list[str]:
         return [
             f"# HELP {self.name} {self.help_text}",
-            f"# TYPE {self.name} gauge",
+            f"# TYPE {self.name} {self.metric_type}",
             f"{self.name} {self.value}",
         ]
+
+
+class _LabeledGauge:
+    def __init__(self, name: str, help_text: str, label_name: str) -> None:
+        self.name = name
+        self.help_text = help_text
+        self.label_name = label_name
+        self.values: dict[str, float] = {}
+
+    def set(self, label: str, value: float) -> None:
+        self.values[label] = float(value)
+
+    def render(self) -> list[str]:
+        lines = [
+            f"# HELP {self.name} {self.help_text}",
+            f"# TYPE {self.name} gauge",
+        ]
+        for label, value in sorted(self.values.items()):
+            lines.append(f'{self.name}{{{self.label_name}="{label}"}} {value}')
+        return lines
+
+
+class _SingleLabelCounter:
+    def __init__(self, name: str, help_text: str, label_name: str) -> None:
+        self.name = name
+        self.help_text = help_text
+        self.label_name = label_name
+        self.values: defaultdict[str, float] = defaultdict(float)
+
+    def inc(self, label: str) -> None:
+        self.values[label] += 1.0
+
+    def render(self) -> list[str]:
+        lines = [
+            f"# HELP {self.name} {self.help_text}",
+            f"# TYPE {self.name} counter",
+        ]
+        for label, value in sorted(self.values.items()):
+            lines.append(f'{self.name}{{{self.label_name}="{label}"}} {value}')
+        return lines
 
 
 class _LabeledCounter:
@@ -205,6 +253,54 @@ class _Histogram:
         return lines
 
 
+@dataclass(frozen=True)
+class _ResourceSnapshot:
+    service_rss_bytes: int | None
+    runner_rss_bytes: int | None
+    tree_rss_bytes: int | None
+    service_cpu_seconds: float | None
+    runner_cpu_seconds: float | None
+    tree_cpu_seconds: float | None
+
+
+def _one_process_usage(pid: int | None, *, children: bool) -> tuple[int, float] | None:
+    if pid is None:
+        return None
+    try:
+        root = psutil.Process(pid)
+        processes = [root, *root.children(recursive=True)] if children else [root]
+        seen: set[int] = set()
+        rss_bytes = 0
+        cpu_seconds = 0.0
+        for process in processes:
+            if process.pid in seen:
+                continue
+            seen.add(process.pid)
+            try:
+                rss_bytes += int(process.memory_info().rss)
+                cpu = process.cpu_times()
+                cpu_seconds += float(cpu.user) + float(cpu.system)
+            except (psutil.Error, OSError):
+                continue
+        return rss_bytes, cpu_seconds
+    except (psutil.Error, OSError, ValueError):
+        return None
+
+
+def _resource_snapshot(runner_pid: int | None) -> _ResourceSnapshot:
+    service = _one_process_usage(os.getpid(), children=False)
+    runner = _one_process_usage(runner_pid, children=True)
+    tree = _one_process_usage(os.getpid(), children=True)
+    return _ResourceSnapshot(
+        service_rss_bytes=service[0] if service is not None else None,
+        runner_rss_bytes=runner[0] if runner is not None else None,
+        tree_rss_bytes=tree[0] if tree is not None else None,
+        service_cpu_seconds=service[1] if service is not None else None,
+        runner_cpu_seconds=runner[1] if runner is not None else None,
+        tree_cpu_seconds=tree[1] if tree is not None else None,
+    )
+
+
 class ServiceMetrics:
     def __init__(self, model_version: str) -> None:
         self.requests = _LabeledCounter(
@@ -241,6 +337,48 @@ class ServiceMetrics:
             "Inference endpoint processing time, including runner queue time.",
             buckets,
         )
+        self.request_cpu_seconds = _Histogram(
+            "imu_cloud_request_cpu_seconds",
+            "Process-tree CPU time consumed while handling an inference request.",
+            buckets,
+        )
+        byte_buckets = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+        self.request_body_bytes = _Histogram(
+            "imu_cloud_request_body_bytes",
+            "Inference HTTP request body size in bytes.",
+            byte_buckets,
+        )
+        self.response_body_bytes = _Histogram(
+            "imu_cloud_response_body_bytes",
+            "Inference HTTP response body size in bytes.",
+            byte_buckets,
+        )
+        self.http_requests = _SingleLabelCounter(
+            "imu_cloud_inference_http_requests_total",
+            "Inference HTTP requests by response status class.",
+            "status_class",
+        )
+        self.process_rss = _LabeledGauge(
+            "imu_cloud_process_resident_memory_bytes",
+            "Resident memory observed for service, runner, and combined process tree.",
+            "scope",
+        )
+        self.process_peak_rss = _LabeledGauge(
+            "imu_cloud_process_peak_resident_memory_bytes",
+            "Maximum resident memory observed by this service process.",
+            "scope",
+        )
+        self.process_cpu = _LabeledGauge(
+            "imu_cloud_process_cpu_seconds",
+            "Cumulative CPU time currently visible for each process scope.",
+            "scope",
+        )
+        self.runner_restarts = _Gauge(
+            "imu_cloud_runner_restarts_total",
+            "Native runner restarts since service process startup.",
+            metric_type="counter",
+        )
+        self._resource_peaks = {"service": 0, "runner": 0, "tree": 0}
         self.in_progress = _Gauge(
             "imu_cloud_inferences_in_progress",
             "Inference requests currently being handled.",
@@ -261,12 +399,68 @@ class ServiceMetrics:
             f'model_version="{_escape_prometheus_label(model_version)}"}} 1.0'
         )
 
+    def sample_resources(self, runner_pid: int | None) -> _ResourceSnapshot:
+        snapshot = _resource_snapshot(runner_pid)
+        values = {
+            "service": (snapshot.service_rss_bytes, snapshot.service_cpu_seconds),
+            "runner": (snapshot.runner_rss_bytes, snapshot.runner_cpu_seconds),
+            "tree": (snapshot.tree_rss_bytes, snapshot.tree_cpu_seconds),
+        }
+        for scope, (rss_bytes, cpu_seconds) in values.items():
+            if rss_bytes is not None:
+                self._resource_peaks[scope] = max(self._resource_peaks[scope], rss_bytes)
+                self.process_rss.set(scope, rss_bytes)
+                self.process_peak_rss.set(scope, self._resource_peaks[scope])
+            if cpu_seconds is not None:
+                self.process_cpu.set(scope, cpu_seconds)
+        return snapshot
+
+    def resource_payload(
+        self,
+        before: _ResourceSnapshot,
+        after: _ResourceSnapshot,
+    ) -> dict[str, int | None]:
+        request_cpu_us = None
+        if before.tree_cpu_seconds is not None and after.tree_cpu_seconds is not None:
+            request_cpu_us = max(
+                0,
+                round((after.tree_cpu_seconds - before.tree_cpu_seconds) * 1_000_000),
+            )
+            self.request_cpu_seconds.observe(request_cpu_us / 1_000_000)
+        return {
+            "service_rss_bytes": after.service_rss_bytes,
+            "runner_rss_bytes": after.runner_rss_bytes,
+            "process_tree_rss_bytes": after.tree_rss_bytes,
+            "process_tree_peak_rss_bytes": self._resource_peaks["tree"] or None,
+            "request_cpu_us": request_cpu_us,
+        }
+
+    def observe_http(
+        self,
+        status_code: int,
+        request_bytes: int | None,
+        response_bytes: int | None,
+    ) -> None:
+        self.http_requests.inc(f"{status_code // 100}xx")
+        if request_bytes is not None:
+            self.request_body_bytes.observe(request_bytes)
+        if response_bytes is not None:
+            self.response_body_bytes.observe(response_bytes)
+
     def render(self) -> bytes:
         lines: list[str] = []
         lines.extend(self.requests.render())
         lines.extend(self.inference_seconds.render())
         lines.extend(self.queue_seconds.render())
         lines.extend(self.request_seconds.render())
+        lines.extend(self.request_cpu_seconds.render())
+        lines.extend(self.request_body_bytes.render())
+        lines.extend(self.response_body_bytes.render())
+        lines.extend(self.http_requests.render())
+        lines.extend(self.process_rss.render())
+        lines.extend(self.process_peak_rss.render())
+        lines.extend(self.process_cpu.render())
+        lines.extend(self.runner_restarts.render())
         lines.extend(self.in_progress.render())
         lines.extend(self.runner_up.render())
         lines.extend(self.startup_seconds.render())
@@ -323,6 +517,29 @@ def create_app(
 
     @application.middleware("http")
     async def protect_and_limit(request: Request, call_next: Any) -> Response:
+        inference_request = request.url.path == "/v1/infer"
+        request_bytes: int | None = None
+        raw_length = request.headers.get("content-length")
+        if inference_request and raw_length:
+            try:
+                request_bytes = max(0, int(raw_length))
+            except ValueError:
+                request_bytes = None
+
+        def finish(response: Response) -> Response:
+            if inference_request:
+                raw_response_length = response.headers.get("content-length")
+                try:
+                    response_bytes = (
+                        max(0, int(raw_response_length))
+                        if raw_response_length is not None
+                        else None
+                    )
+                except ValueError:
+                    response_bytes = None
+                metrics.observe_http(response.status_code, request_bytes, response_bytes)
+            return response
+
         if request.url.path in PROTECTED_PATHS:
             if not service_settings.allow_unauthenticated:
                 header = request.headers.get("authorization", "")
@@ -334,24 +551,29 @@ def create_app(
                     and secrets.compare_digest(token, service_settings.api_key)
                 )
                 if not authenticated:
-                    return JSONResponse(
+                    return finish(JSONResponse(
                         status_code=401,
                         content={"ok": False, "error": "Unauthorized."},
                         headers={"WWW-Authenticate": "Bearer"},
-                    )
-        if request.url.path == "/v1/infer":
-            raw_length = request.headers.get("content-length")
+                    ))
+        if inference_request:
             if raw_length:
                 try:
                     too_large = int(raw_length) > service_settings.max_body_bytes
                 except ValueError:
                     too_large = True
                 if too_large:
-                    return JSONResponse(
+                    return finish(JSONResponse(
                         status_code=413,
                         content={"ok": False, "error": "Request body is too large."},
-                    )
-        return await call_next(request)
+                    ))
+        try:
+            response = await call_next(request)
+        except BaseException:
+            if inference_request:
+                metrics.observe_http(500, request_bytes, None)
+            raise
+        return finish(response)
 
     @application.get("/")
     async def service_info() -> dict[str, Any]:
@@ -390,6 +612,8 @@ def create_app(
 
     @application.get("/metrics")
     async def prometheus_metrics() -> Response:
+        metrics.sample_resources(getattr(model_runner, "pid", None))
+        metrics.runner_restarts.set(getattr(model_runner, "restart_count", 0))
         return Response(
             content=metrics.render(),
             media_type=PROMETHEUS_CONTENT_TYPE,
@@ -400,6 +624,8 @@ def create_app(
         request_started_ns = time.perf_counter_ns()
         warmup_label = "true" if payload.warmup else "false"
         metrics.in_progress.inc()
+        before_resources = metrics.sample_resources(getattr(model_runner, "pid", None))
+        resource_usage: dict[str, int | None]
         try:
             result = await model_runner.classify(payload.window_id, payload.features)
         except RunnerError as error:
@@ -409,6 +635,9 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(error)) from error
         finally:
             metrics.in_progress.dec()
+            after_resources = metrics.sample_resources(getattr(model_runner, "pid", None))
+            resource_usage = metrics.resource_payload(before_resources, after_resources)
+            metrics.runner_restarts.set(getattr(model_runner, "restart_count", 0))
             server_us = max(
                 0,
                 (time.perf_counter_ns() - request_started_ns) // 1000,
@@ -432,6 +661,7 @@ def create_app(
                 "inference": result.inference_us,
                 "server": server_us,
             },
+            "resource_usage": resource_usage,
         }
 
     return application

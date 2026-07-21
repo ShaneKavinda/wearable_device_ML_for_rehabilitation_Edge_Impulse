@@ -218,6 +218,8 @@ class ModelBackendTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.backend, "local")
         self.assertEqual(backend.deployment_id, 0)
         self.assertEqual(result.inference_us, 25)
+        self.assertIsNone(result.transport_residual_us)
+        self.assertGreaterEqual(result.backend_overhead_us, 0)
 
     async def test_rest_backend_accepts_label_score_mapping(self):
         backend = model_backends.RestModelBackend(
@@ -242,6 +244,89 @@ class ModelBackendTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.deployment_id, 2)
         self.assertEqual(result.model_version, "cloud-3")
         self.assertEqual(result.scores[1], 0.75)
+        self.assertIsNone(result.server_us)
+        self.assertIsNone(result.transport_residual_us)
+
+    async def test_rest_backend_keeps_http_and_server_timing_separate(self):
+        backend = model_backends.RestModelBackend(
+            backend="cloud",
+            url="https://model.example/infer",
+            api_key="secret",
+            timeout_s=2,
+            model_version="19",
+        )
+        response_body = {
+            "scores": [0.1, 0.5, 0.1, 0.1, 0.1, 0.1],
+            "inference_us": 1200,
+            "timing_us": {"queue": 25, "server": 1300},
+            "resource_usage": {
+                "process_tree_rss_bytes": 60000000,
+                "process_tree_peak_rss_bytes": 61000000,
+                "request_cpu_us": 1400,
+            },
+        }
+        backend._post_json = lambda payload: model_backends._HttpJsonResponse(
+            body=response_body,
+            request_bytes=2048,
+            response_bytes=512,
+        )
+
+        result = await backend.classify(8, [0.0] * 198)
+
+        self.assertEqual(result.inference_us, 1200)
+        self.assertEqual(result.server_us, 1300)
+        self.assertEqual(result.queue_us, 25)
+        self.assertEqual(
+            result.transport_residual_us,
+            max(0, result.backend_wall_us - result.server_us),
+        )
+        self.assertEqual(result.request_bytes, 2048)
+        self.assertEqual(result.response_bytes, 512)
+        self.assertEqual(result.backend_rss_bytes, 60000000)
+        self.assertEqual(result.backend_peak_rss_bytes, 61000000)
+        self.assertEqual(result.backend_cpu_us, 1400)
+
+    def test_rest_backend_classifies_transport_timeout(self):
+        backend = model_backends.RestModelBackend(
+            backend="cloud",
+            url="https://model.example/infer",
+            api_key="secret",
+            timeout_s=2,
+            model_version="19",
+        )
+        with patch.object(
+            model_backends.urllib.request,
+            "urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            with self.assertRaises(model_backends.ModelBackendTimeoutError):
+                backend._post_json({"features": []})
+
+    def test_process_tree_sampler_sums_live_processes_and_ignores_exited_child(self):
+        live_child = SimpleNamespace(
+            pid=11,
+            memory_info=lambda: SimpleNamespace(rss=200),
+            cpu_times=lambda: SimpleNamespace(user=0.2, system=0.1),
+        )
+        exited_child = SimpleNamespace(
+            pid=12,
+            memory_info=lambda: (_ for _ in ()).throw(model_backends.psutil.NoSuchProcess(12)),
+            cpu_times=lambda: SimpleNamespace(user=9.0, system=9.0),
+        )
+        root = SimpleNamespace(
+            pid=10,
+            children=lambda recursive: [live_child, exited_child],
+            memory_info=lambda: SimpleNamespace(rss=100),
+            cpu_times=lambda: SimpleNamespace(user=0.4, system=0.3),
+        )
+        sampler = model_backends.ProcessTreeSampler()
+
+        with patch.object(model_backends.psutil, "Process", return_value=root):
+            usage = sampler.sample(10)
+
+        self.assertEqual(usage.rss_bytes, 300)
+        self.assertAlmostEqual(usage.cpu_seconds, 1.0)
+        self.assertEqual(sampler.peak_rss_bytes, 300)
 
     def test_remote_backend_rejects_non_http_url(self):
         with self.assertRaisesRegex(
