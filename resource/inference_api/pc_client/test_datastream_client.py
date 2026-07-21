@@ -475,6 +475,23 @@ class RestApiTest(unittest.TestCase):
         self.assertIn('id="modelBackend"', dashboard.text)
         self.assertIn("/api/events", dashboard.text)
 
+    def test_dashboard_polling_preserves_unsaved_config_fields(self):
+        dashboard = datastream_client.web_gui_html()
+
+        self.assertIn("const dirtyConfigFields = new Set();", dashboard)
+        self.assertIn("if (dirtyConfigFields.has(id)) return;", dashboard)
+        self.assertIn("const submittedRevision = configEditRevision;", dashboard)
+        self.assertIn("dirtyConfigFields.clear();", dashboard)
+        self.assertIn("markConfigDirty('bleDeviceId');", dashboard)
+        self.assertIn(
+            "renderConfigValue('modelUrl', state.config?.model_url || '');",
+            dashboard,
+        )
+        self.assertNotIn(
+            "$('modelUrl').value = state.config?.model_url || '';",
+            dashboard,
+        )
+
     def test_benchmark_deduplication_summary_and_csv_export(self):
         try:
             from fastapi.testclient import TestClient

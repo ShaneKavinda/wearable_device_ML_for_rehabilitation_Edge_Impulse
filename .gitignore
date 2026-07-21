@@ -1,0 +1,10 @@
+plans/*
+resource/inference_api/pc_client/__pycache__/*
+resource/inference_api/pc_client/logs/*
+log.txt
+meeting_notes.md
+.env
+**/.env
+**/__pycache__/
+**/.pytest_cache/
+**/venv/

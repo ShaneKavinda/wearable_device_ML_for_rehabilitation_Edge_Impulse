@@ -76,6 +76,10 @@ between its wall time and the reported server time.
 
 ## Cloud deployment
 
+For CSC infrastructure, follow the complete
+[Rahti and cPouta deployment guide](CSC_RAHTI_CPOUTA_DEPLOYMENT.md). If a build
+or rollout fails, check the [cloud deployment troubleshooting FAQ](FAQ.md).
+
 Push the built image to the chosen registry and configure the cloud service with:
 
 - container port `8080` (or inject the platform's `PORT` value);

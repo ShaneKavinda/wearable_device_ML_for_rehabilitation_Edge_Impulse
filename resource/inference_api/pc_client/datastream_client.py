@@ -1584,6 +1584,32 @@ def web_gui_html() -> str:
   <script>
     let lastEventId = 0;
     const $ = (id) => document.getElementById(id);
+    const configFieldIds = [
+      'sourceType', 'port', 'baud', 'logDir', 'bleDeviceId', 'bleName',
+      'runnerPath', 'modelBackend', 'modelUrl', 'modelApiKey',
+      'modelTimeout', 'modelVersion', 'saveInvalid'
+    ];
+    const dirtyConfigFields = new Set();
+    let configEditRevision = 0;
+
+    function markConfigDirty(id) {
+      dirtyConfigFields.add(id);
+      configEditRevision += 1;
+    }
+
+    for (const id of configFieldIds) {
+      $(id).addEventListener('input', () => markConfigDirty(id));
+    }
+
+    function renderConfigValue(id, value) {
+      if (dirtyConfigFields.has(id)) return;
+      $(id).value = value;
+    }
+
+    function renderConfigChecked(id, checked) {
+      if (dirtyConfigFields.has(id)) return;
+      $(id).checked = checked;
+    }
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
@@ -1599,14 +1625,19 @@ def web_gui_html() -> str:
 
     async function refreshAll() {
       const sources = await api('/api/sources');
+      const selectedSource = $('sourceType').value;
       $('sourceType').innerHTML = sources.sources.map(
         (source) => `<option value="${source.type}">${source.name}</option>`
       ).join('');
+      if (dirtyConfigFields.has('sourceType')) {
+        $('sourceType').value = selectedSource;
+      }
       renderState(await api('/api/state'));
       await refreshBenchmarks();
     }
 
     async function saveConfig() {
+      const submittedRevision = configEditRevision;
       const state = await api('/api/config', {
         method: 'PUT',
         body: JSON.stringify({
@@ -1625,6 +1656,9 @@ def web_gui_html() -> str:
           model_version: $('modelVersion').value
         })
       });
+      if (configEditRevision === submittedRevision) {
+        dirtyConfigFields.clear();
+      }
       renderState(state);
     }
 
@@ -1705,7 +1739,10 @@ def web_gui_html() -> str:
     function chooseBleDevice() {
       const selector = $('bleDevices');
       const option = selector.options[selector.selectedIndex];
-      if (option?.value) $('bleDeviceId').value = option.value;
+      if (option?.value) {
+        $('bleDeviceId').value = option.value;
+        markConfigDirty('bleDeviceId');
+      }
     }
 
     async function refreshBenchmarks() {
@@ -1722,22 +1759,25 @@ def web_gui_html() -> str:
       $('connected').textContent = state.connected ? 'yes' : 'no';
       $('source').textContent = state.config?.source_type || '-';
       $('activeModel').textContent = state.config?.model_backend || '-';
-      $('sourceType').value = state.config?.source_type || $('sourceType').value;
+      renderConfigValue(
+        'sourceType',
+        state.config?.source_type || $('sourceType').value
+      );
       $('serialPort').textContent = state.config?.port || '-';
       $('valid').textContent = state.stats?.valid_count ?? 0;
       $('invalid').textContent = state.stats?.invalid_count ?? 0;
       $('logFile').textContent = state.log_file || '-';
-      $('port').value = state.config?.port || $('port').value;
-      $('baud').value = state.config?.baud || 115200;
-      $('logDir').value = state.config?.log_dir || 'logs';
-      $('saveInvalid').checked = Boolean(state.config?.save_invalid);
-      $('bleDeviceId').value = state.config?.ble_device_id || '';
-      $('bleName').value = state.config?.ble_name || 'IMU-Raw-Stream';
-      $('runnerPath').value = state.config?.runner_path || '';
-      $('modelBackend').value = state.config?.model_backend || 'local';
-      $('modelUrl').value = state.config?.model_url || '';
-      $('modelTimeout').value = state.config?.model_timeout_s || 10;
-      $('modelVersion').value = state.config?.model_version || '19';
+      renderConfigValue('port', state.config?.port || $('port').value);
+      renderConfigValue('baud', state.config?.baud || 115200);
+      renderConfigValue('logDir', state.config?.log_dir || 'logs');
+      renderConfigChecked('saveInvalid', Boolean(state.config?.save_invalid));
+      renderConfigValue('bleDeviceId', state.config?.ble_device_id || '');
+      renderConfigValue('bleName', state.config?.ble_name || 'IMU-Raw-Stream');
+      renderConfigValue('runnerPath', state.config?.runner_path || '');
+      renderConfigValue('modelBackend', state.config?.model_backend || 'local');
+      renderConfigValue('modelUrl', state.config?.model_url || '');
+      renderConfigValue('modelTimeout', state.config?.model_timeout_s || 10);
+      renderConfigValue('modelVersion', state.config?.model_version || '19');
     }
 
     function appendEvent(envelope) {
