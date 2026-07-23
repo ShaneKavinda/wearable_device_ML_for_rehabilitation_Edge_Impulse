@@ -1,9 +1,14 @@
-# Cloud inference container
+# REST inference container for cloud or LAN edge deployment
 
 This OCI image serves the real Edge Impulse project `738400`, deployment `19`,
 through the REST contract already used by the PC coordinator. The model archive
 is validated and compiled during the image build. The runtime starts the native
 runner once, warms it before becoming ready, and keeps it alive between requests.
+
+The same image can run in Rahti, on a cPouta VM, or on a separate Ubuntu Server
+inside the local network. On Ubuntu it represents a remote edge-inference node:
+the PC still captures the IMU window, while DSP and classification execute on
+the Ubuntu device.
 
 ## Build and run locally
 
@@ -38,9 +43,188 @@ the key must contain at least 16 characters.
 For an isolated local test only, authentication can be disabled with
 `ALLOW_UNAUTHENTICATED=true`.
 
+## Deploy on an Ubuntu Server edge device
+
+Use a physically separate Ubuntu machine, mini-PC, or SBC for a meaningful edge
+comparison. An Ubuntu VM running on the coordinator PC does not isolate compute
+or network effects in the same way.
+
+### 1. Check the server and repository
+
+Docker Engine and the Docker Compose plugin must be installed. Confirm both are
+available:
+
+```bash
+docker --version
+docker-compose version
+```
+
+If either command is missing, install Docker Engine using the
+[official Ubuntu instructions](https://docs.docker.com/engine/install/ubuntu/).
+Adding a user to the `docker` group grants root-equivalent control of Docker;
+follow the server administrator's security policy.
+
+Move to the root of the repository already cloned on the Ubuntu server and
+confirm that the Dockerfile and exported model are present:
+
+```bash
+cd "<REPOSITORY_ROOT>"
+test -f resource/inference_api/cloud_service/Dockerfile
+test -f resource/exported_model/ei_gesture_left_hand_imu_arduino.zip
+```
+
+The Docker build compiles a Linux native runner for the server's architecture
+and runs a real inference before producing the runtime image. Build on the edge
+device itself, especially for ARM64. Do not deploy the image if that smoke test
+fails.
+
+### 2. Give the server a stable LAN address
+
+Use a DHCP reservation or static address so the PC coordinator does not lose
+the endpoint between experiments. Display the server addresses with:
+
+```bash
+hostname -I
+```
+
+Choose the address on the same trusted LAN as the coordinator PC. The examples
+below call it `<EDGE_LAN_IP>`.
+
+### 3. Create the protected Compose environment
+
+Move to the service directory, generate a bearer key, and bind the published
+port only to the chosen LAN interface:
+
+```bash
+cd "<REPOSITORY_ROOT>/resource/inference_api/cloud_service"
+
+EDGE_LAN_IP="<EDGE_LAN_IP>"
+API_KEY="$(openssl rand -hex 32)"
+umask 077
+printf 'API_KEY=%s\nHOST_PORT=%s:8080\n' "$API_KEY" "$EDGE_LAN_IP" > .env
+printf 'Save this API key securely: %s\n' "$API_KEY"
+unset API_KEY EDGE_LAN_IP
+```
+
+The repository ignores `.env`, but it still contains a secret. Keep it readable
+only by the deployment administrator and store the displayed API key in a
+password manager.
+
+`HOST_PORT=<EDGE_LAN_IP>:8080` avoids listening on every server interface. Do
+not add an Internet-router port-forward for port `8080`.
+
+### 4. Build and start the edge service
+
+Validate the Compose service name without printing the expanded environment,
+then build and start it:
+
+```bash
+docker compose --env-file .env -f compose.yaml config --services
+docker compose --env-file .env -f compose.yaml up -d --build
+```
+
+The supplied Compose configuration runs one persistent inference process with a
+read-only filesystem, dropped Linux capabilities, a 64-process limit, one CPU,
+and 512 MiB of memory. Inspect the result:
+
+```bash
+docker compose --env-file .env -f compose.yaml ps
+docker compose --env-file .env -f compose.yaml logs --tail=200 inference
+```
+
+### 5. Verify the LAN endpoint
+
+On the Ubuntu server, check readiness and authenticated metrics:
+
+```bash
+EDGE_LAN_IP="$(sed -n 's/^HOST_PORT=\(.*\):8080$/\1/p' .env)"
+API_KEY="$(sed -n 's/^API_KEY=//p' .env)"
+
+curl --fail --silent --show-error \
+  "http://$EDGE_LAN_IP:8080/readyz"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $API_KEY" \
+  "http://$EDGE_LAN_IP:8080/metrics" | grep '^imu_cloud_'
+
+unset API_KEY EDGE_LAN_IP
+```
+
+From the coordinator PC, first confirm that the server is reachable:
+
+```powershell
+Test-NetConnection -ComputerName "<EDGE_LAN_IP>" -Port 8080
+Invoke-RestMethod "http://<EDGE_LAN_IP>:8080/readyz"
+```
+
+If the connection fails, check the server address, LAN/VLAN isolation, Docker
+port binding, and the host firewall. Docker-published ports can bypass some UFW
+rules, so do not rely on UFW alone to protect an Internet-facing host.
+
+### 6. Connect the PC coordinator
+
+Open the PC dashboard and configure:
+
+```text
+Model deployment: Remote edge REST model
+Model REST URL:   http://<EDGE_LAN_IP>:8080/v1/infer
+Model API key:    <THE_SAVED_API_KEY>
+Model timeout:    10
+Model version:    ei-738400-deployment-19
+```
+
+Save the configuration and connect the IMU source and model backend. Selecting
+`Remote edge REST model` records deployment ID `1` and labels benchmark rows as
+`edge`.
+
+The direct LAN example uses HTTP. Although bearer authentication prevents an
+unauthenticated request, HTTP does not encrypt the API key or IMU features. Use
+an isolated trusted test LAN; for a shared or untrusted network, put the service
+behind TLS or a VPN such as WireGuard.
+
+For comparable experiments, record the server hardware, operating system,
+Ethernet or Wi-Fi profile, CPU and memory limits, concurrency, and run type in
+the dashboard experiment profile. Run local PC, LAN edge, and Rahti tests with
+the same captured inputs and separate cold-start from steady-state runs.
+
+### 7. Update, restart, or stop the edge service
+
+To deploy a later repository revision without changing the `.env` key or LAN
+address:
+
+```bash
+cd "<REPOSITORY_ROOT>"
+git pull --ff-only
+cd resource/inference_api/cloud_service
+docker compose --env-file .env -f compose.yaml up -d --build
+docker compose --env-file .env -f compose.yaml ps
+docker compose --env-file .env -f compose.yaml logs --tail=200 inference
+```
+
+Restart the existing container without rebuilding:
+
+```bash
+docker compose --env-file .env -f compose.yaml restart inference
+```
+
+Stop and remove the container and Compose network:
+
+```bash
+docker compose --env-file .env -f compose.yaml down
+```
+
+The service stores no application data in a Docker volume. Retain `.env` if the
+same endpoint and bearer key will be used again, or delete it securely when the
+edge deployment is permanently retired.
+
+This topology measures remote edge inference, not a fully autonomous edge
+sensor. BLE acquisition and capture coordination still run on the PC. A fully
+sensor-side architecture would also move IMU acquisition and window assembly to
+the Ubuntu device or embedded hardware.
+
 ## Connect the coordinator
 
-In the PC dashboard, select **Cloud REST model** and configure:
+For a cloud deployment, select **Cloud REST model** in the PC dashboard and
+configure:
 
 - model URL: `https://<cloud-host>/v1/infer`;
 - API key: the value injected into the container;

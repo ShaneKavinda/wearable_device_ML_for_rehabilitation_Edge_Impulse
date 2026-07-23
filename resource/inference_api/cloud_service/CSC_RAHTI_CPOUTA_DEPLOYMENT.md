@@ -449,34 +449,151 @@ After saving the key, remove it from the PowerShell session:
 Remove-Variable ApiKey, Headers, WarmupBody, MeasuredBody -ErrorAction SilentlyContinue
 ```
 
-### 3.9 Update, roll back, and remove the Rahti deployment
+### 3.9 Rebuild and redeploy an existing Rahti service
 
-After changing code, rebuild the same ImageStream tag and restart the Deployment:
+A routine code or dependency update does **not** require deleting the Deployment,
+Service, Route, Secret, BuildConfig, ImageStream, or Rahti project. Rebuild the
+image in place and restart the existing Deployment. This preserves the REST URL
+and API key.
 
-```powershell
-oc start-build $ImageName --from-dir=. --follow
-oc rollout restart deployment/$AppName
-oc rollout status deployment/$AppName --timeout=5m
-```
-
-Roll back to the previous Deployment revision if needed:
-
-```powershell
-oc rollout history deployment/$AppName
-oc rollout undo deployment/$AppName
-```
-
-When the test is finished, these commands delete the app, Route, Secret, build
-configuration, and stored image from the current Rahti project:
+PowerShell variables are lost when the terminal closes. Start a new deployment
+session from the **repository root**, recreate the variables, and select the
+correct Rahti project:
 
 ```powershell
-oc delete route,service,deployment,secret $AppName
-oc delete buildconfig $ImageName
-oc delete imagestream $ImageName
+Set-Location "<REPOSITORY_ROOT>"
+
+$Oc = if (Test-Path -LiteralPath ".\oc.exe") {
+    (Resolve-Path -LiteralPath ".\oc.exe").Path
+} else {
+    "oc"
+}
+$RahtiProject = "<YOUR_RAHTI_PROJECT_NAME>"
+$AppName = "imu-rehab-inference"
+$ImageName = "imu-rehab-cloud-inference"
+$ImageTag = "deployment-19"
+
+& $Oc whoami
+& $Oc project $RahtiProject
+& $Oc status
 ```
 
-Do not delete the entire Rahti project unless all resources in that namespace are
-known to be disposable.
+If `whoami` reports that the session has expired, repeat the login step from
+section 3.3 and then select the project again. Do not paste a login token into the
+guide, a script, or Git.
+
+Confirm that the existing build and deployment resources are present and that
+the repository-root files needed by the Docker build exist:
+
+```powershell
+& $Oc get buildconfig $ImageName
+& $Oc get imagestream $ImageName
+& $Oc get deployment $AppName
+
+if (-not (Test-Path -LiteralPath "resource/inference_api/cloud_service/Dockerfile")) {
+    throw "Run this procedure from the repository root; Dockerfile was not found."
+}
+if (-not (Test-Path -LiteralPath "resource/exported_model/ei_gesture_left_hand_imu_arduino.zip")) {
+    throw "The exported Edge Impulse model ZIP was not found."
+}
+
+& $Oc get buildconfig $ImageName `
+  -o 'jsonpath={.spec.strategy.dockerStrategy.dockerfilePath}'
+Write-Host ""
+```
+
+The displayed BuildConfig path must be:
+
+```text
+resource/inference_api/cloud_service/Dockerfile
+```
+
+The BuildConfig expects a repository-root build context. Therefore,
+`--from-dir=.` must be run from the repository root. Running it from
+`resource/inference_api/cloud_service` uploads too little of the repository and
+causes `ManageDockerfileFailed` with a `Dockerfile: no such file or directory`
+message.
+
+Optionally preserve the currently deployed ImageStream image under an immutable
+rollback tag before replacing the mutable `deployment-19` tag:
+
+```powershell
+$RollbackTag = "rollback-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+& $Oc tag "${ImageName}:$ImageTag" "${ImageName}:$RollbackTag"
+```
+
+Start and follow the binary build:
+
+```powershell
+& $Oc start-build $ImageName --from-dir=. --follow
+if ($LASTEXITCODE -ne 0) {
+    throw "Rahti image build failed. Inspect the latest Build logs before continuing."
+}
+
+& $Oc get builds --sort-by=.metadata.creationTimestamp
+& $Oc get imagestreamtag "${ImageName}:$ImageTag"
+```
+
+Do not restart the application if the build failed. A successful build updates
+the ImageStream tag. Point the Deployment at the expected internal image, then
+restart it so the Pod pulls that updated tag:
+
+```powershell
+$InternalImage = "image-registry.openshift-image-registry.svc:5000/$RahtiProject/${ImageName}:$ImageTag"
+
+& $Oc set image "deployment/$AppName" "inference=$InternalImage"
+& $Oc rollout restart "deployment/$AppName"
+& $Oc rollout status "deployment/$AppName" --timeout=5m
+```
+
+For an image-only update, do not reapply `kubernetes.yaml`: its image value is a
+documented placeholder. If resource limits, probes, annotations, or other Pod
+settings also changed, repeat the templated `oc apply` command in section 3.6,
+which inserts the current Rahti project and ImageStream name.
+
+Inspect the running Pod, resolved image digest, logs, and public probes:
+
+```powershell
+& $Oc get pods -l "app.kubernetes.io/name=$AppName" -o wide
+& $Oc get pods -l "app.kubernetes.io/name=$AppName" `
+  -o 'custom-columns=POD:.metadata.name,IMAGE:.spec.containers[0].image,IMAGE_ID:.status.containerStatuses[0].imageID,READY:.status.containerStatuses[0].ready,RESTARTS:.status.containerStatuses[0].restartCount'
+& $Oc logs "deployment/$AppName" --tail=200
+
+$RouteHost = & $Oc get route $AppName -o 'jsonpath={.spec.host}'
+$BaseUrl = "https://$RouteHost"
+Invoke-RestMethod "$BaseUrl/healthz"
+Invoke-RestMethod "$BaseUrl/readyz"
+```
+
+Repeat the authenticated inference and `/metrics` checks from section 3.8 before
+starting a benchmark. The Route URL and existing Secret should not change during
+this procedure.
+
+If the new image fails, deploy the rollback tag created above:
+
+```powershell
+$RollbackImage = "image-registry.openshift-image-registry.svc:5000/$RahtiProject/${ImageName}:$RollbackTag"
+& $Oc set image "deployment/$AppName" "inference=$RollbackImage"
+& $Oc rollout status "deployment/$AppName" --timeout=5m
+```
+
+`oc rollout undo` can restore an earlier Deployment configuration revision, but
+it is not a reliable image rollback when every revision uses the same mutable
+`deployment-19` tag. Use the preserved rollback tag or an immutable image digest
+when the image itself must be restored.
+
+When the test is permanently finished, these commands delete the app, Route,
+Secret, build configuration, and stored images from the current Rahti project:
+
+```powershell
+& $Oc delete route,service,deployment,secret $AppName
+& $Oc delete buildconfig $ImageName
+& $Oc delete imagestream $ImageName
+```
+
+Do not run the deletion commands for an ordinary rebuild. Do not delete the
+entire Rahti project unless every resource in that namespace is known to be
+disposable.
 
 ---
 
@@ -967,7 +1084,8 @@ or Prometheus labels.
 
 | Symptom | Most likely checks |
 | --- | --- |
-| Rahti build fails immediately | Run from repository root; confirm the Dockerfile and model ZIP exist; inspect `oc logs build/<build-name>`. |
+| Rahti build fails immediately | Run from the repository root; confirm the Dockerfile and model ZIP exist; inspect `oc logs build/<build-name>`. |
+| Rahti build reports `ManageDockerfileFailed` or `Dockerfile: no such file or directory` | The binary upload directory and BuildConfig `dockerfilePath` do not match. With this guide's BuildConfig, run `oc start-build ... --from-dir=.` from the repository root, not from `cloud_service`. |
 | Rahti Pod says `ImagePullBackOff` | Confirm the ImageStream tag exists and the Deployment image contains the exact current Rahti namespace. |
 | Rahti Pod is rejected by SCC | Ensure the manifest does not set a fixed UID/GID, privileged mode, or extra capabilities. |
 | Rahti returns 503 | Check Deployment readiness, Service selectors, endpoints, and Route target port. |
