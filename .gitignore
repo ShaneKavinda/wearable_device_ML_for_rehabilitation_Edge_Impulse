@@ -8,3 +8,4 @@ meeting_notes.md
 **/__pycache__/
 **/.pytest_cache/
 **/venv/
+*.pem
